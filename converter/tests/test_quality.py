@@ -26,5 +26,6 @@ def test_room_labels_are_read():
     res = convert(plan.image)
     labels = " ".join(r.label or "" for r in res.rooms).lower()
     truth = [r.name.lower() for r in plan.rooms if r.name]
+    assert len(truth) >= 10
     found = sum(1 for name in truth if name.split()[0] in labels)
-    assert found >= 0.6 * len(truth)
+    assert found >= 0.6 * len(truth), (found, len(truth))

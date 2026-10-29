@@ -73,18 +73,20 @@ class _RapidOcr(OcrBackend):
         h, w = bgr.shape[:2]
         if h < 32 or w < 32:
             return []
-        det = eng.text_detector
+        # rapidocr-onnxruntime 1.4 calls these text_det and text_rec; 1.2 used longer names.
+        det = getattr(eng, "text_detector", None) or eng.text_det
+        rec = getattr(eng, "text_recognizer", None) or eng.text_rec
         det.postprocess_op.box_thresh = 0.45
         det.postprocess_op.unclip_ratio = 1.6
-        boxes, _ = det(bgr)
+        boxes = det(bgr)[0]
         if boxes is None or len(boxes) == 0:
             return []
         boxes = eng.sorted_boxes(boxes)
         crops = eng.get_crop_img_list(bgr, boxes)
-        recs, _ = eng.text_recognizer(crops)
+        recs = rec(crops)[0]
         items = []
-        for box, (txt, score) in zip(boxes, recs):
-            items.append(TextItem(np.asarray(box, np.float64).reshape(4, 2), str(txt).strip(), float(score)))
+        for box, r in zip(boxes, recs):
+            items.append(TextItem(np.asarray(box, np.float64).reshape(4, 2), str(r[0]).strip(), float(r[1])))
         return items
 
 

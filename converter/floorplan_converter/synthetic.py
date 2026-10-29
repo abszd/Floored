@@ -488,14 +488,16 @@ def generate(seed=0, style=None):
     # Window openings are part of the exterior wall, not of the room.
     gt[ext_wall & ~walls] = 0
 
-    img = _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext)
+    names = {}
+    img = _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names)
 
     rooms = []
     for rid in ids:
         if not np.any(gt == rid):
             continue
         ys_, xs_ = np.nonzero(gt == rid)
-        rooms.append(SynthRoom(rid, kinds[rid - 1], "", (int(xs_.min()), int(ys_.min()), int(xs_.max()), int(ys_.max()))))
+        rooms.append(SynthRoom(rid, kinds[rid - 1], names.get(rid, ""),
+                               (int(xs_.min()), int(ys_.min()), int(xs_.max()), int(ys_.max()))))
 
     plan = SynthPlan(img, gt, rooms, footprint, style, ppm, float(t_int), {"doors": doors, "windows": windows, "t_ext": t_ext})
     if style == "scan":
@@ -508,7 +510,8 @@ def generate(seed=0, style=None):
 # ---------------------------------------------------------------------------
 
 
-def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext):
+def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names):
+    """Draw the plan; the label written in each room goes into ``names`` (room id -> text)."""
     H, W = labels.shape
     ink = (0, 0, 0)
     thin = max(1, int(round(ppm / 30)))
@@ -630,6 +633,7 @@ def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_
             continue
         name = ROOM_NAMES[kind][int(rng.integers(len(ROOM_NAMES[kind])))]
         number += int(rng.integers(1, 4))
+        names[rid] = name
         lines = [name]
         if style in ("gray_fill", "color_fill"):
             lines.append(f"({number})")
