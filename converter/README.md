@@ -36,13 +36,22 @@ distance-transform watershed. That is where its four known problems came from:
 Benchmark on synthetic plans with known rooms, 7 drawing styles × 5 plans
 (`python bench/benchmark.py --seeds 0-4 --legacy`):
 
-BENCHMARK_TABLE
+| Style | New F1 | New mIoU | New split | Outline IoU | Old F1 | Old mIoU | Old split |
+|---|---|---|---|---|---|---|---|
+| solid walls | 0.87 | 0.91 | 5% | 0.99 | 0.52 | 0.80 | 6% |
+| CAD (thin lines) | 0.82 | 0.90 | 3% | 1.00 | 0.38 | 0.71 | 20% |
+| hatched walls | 0.82 | 0.89 | 6% | 1.00 | 0.33 | 0.56 | 11% |
+| gray fill | 0.81 | 0.76 | 3% | 1.00 | 0.73 | 0.79 | 1% |
+| colour fill | 0.96 | 0.92 | 1% | 1.00 | 0.17 | 0.15 | 0% |
+| blueprint (inverted) | 0.83 | 0.88 | 5% | 1.00 | 0.00 | 0.00 | 0% |
+| scan (blur, noise, skew) | 0.65 | 0.69 | 4% | 0.99 | 0.27 | 0.29 | 1% |
+| **all 35 plans** | **0.82** | **0.85** | **4%** | **0.99** | **0.34** | **0.47** | **6%** |
 
 F1 counts a room as found when a predicted room overlaps it with IoU ≥ 0.5
 (one-to-one matching). Split is the share of true rooms cut into two or more
 predicted rooms; merge the share of predictions that swallowed two or more
-true rooms. Times are per plan with four plans running in parallel; a single
-plan takes about 3-4 s on one core.
+true rooms. The old converter's low split rate on some styles is because it
+found few rooms at all there. A plan takes about 3-4 s on one core.
 
 ## Output format
 
@@ -122,8 +131,10 @@ Pass as keyword arguments (`convert(img, debug=True, ocr="none")`) or as a
    rays to the nearest wall. The door width is learned from the swings and the
    gaps themselves.
 6. **Rooms** (`rooms.py`, `fills.py`): the building footprint is the filled
-   main wall network; rooms are its free space between walls and closed
-   doorways. In colour-filled plans fill boundaries separate rooms too. Small
+   main wall network (in painted plans, plus the painted floor joined to it,
+   so dashed glazing and wide entrances do not cut rooms off); rooms are its
+   free space between walls and closed doorways. In colour-filled plans fill
+   boundaries separate rooms too. Small
    pieces are merged, furniture islands absorbed, and rooms joined through a
    narrow neck are split there.
 7. **Labels and kinds** (`classify.py`): texts are assigned to the room they

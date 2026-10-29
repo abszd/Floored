@@ -91,6 +91,14 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool) -> Conversi
     paper = fills.PaperModel(lab, outside)
     painted = fills.painted_fraction(lab, paper, interior)
     has_fills = painted > 0.35
+    if has_fills:
+        # In a painted plan the paint shows the floor even where the outer wall is
+        # broken up (glazing drawn dashed, wide entrances): add painted areas joined to
+        # the building to its footprint.
+        grown = fills.painted_regions(lab, paper, fp, min_area=(2.0 * door) ** 2, width=W.width)
+        if grown.any():
+            fp = ndi.binary_fill_holes(fp | grown)
+            interior = fp & ~W.mask
     soft = np.zeros_like(fp)
     if has_fills and opts.use_fill_boundaries:
         r = int(np.ceil(W.width)) + 2
@@ -292,11 +300,13 @@ def _crop_box(bbox, scale: float, shape, opts: ConverterOptions):
     side = max(x1 - x0, y1 - y0)
     if side <= 0:
         return None
-    m = 0.06 * side + 8
+    # A generous margin: the paper around the plan is what the ink and fill colours
+    # are measured against.
+    m = 0.12 * side + 16
     x0, y0 = max(0, int(x0 - m)), max(0, int(y0 - m))
     x1, y1 = min(w, int(np.ceil(x1 + m))), min(h, int(np.ceil(y1 + m)))
     longest = max(x1 - x0, y1 - y0)
-    if longest >= 0.8 * max(h, w):
+    if longest >= 0.8 * max(h, w) or (x1 - x0) * (y1 - y0) > 0.35 * h * w:
         return None
     if longest > opts.max_working_size:
         new_scale = opts.max_working_size / longest

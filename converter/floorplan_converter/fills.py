@@ -112,3 +112,28 @@ def painted_fraction(lab: np.ndarray, model: PaperModel, inside: np.ndarray) -> 
         xs, ys = xs[pick], ys[pick]
     diff = np.sqrt(((lab[ys, xs] - model.at(xs, ys)) ** 2).sum(axis=1))
     return float((diff > 5.0).mean())
+
+
+def painted_regions(lab: np.ndarray, model: PaperModel, fp: np.ndarray, min_area: float, width: float) -> np.ndarray:
+    """Painted areas (a colour unlike the page, lighter than ink) joined to the building
+    footprint ``fp`` and at least ``min_area`` px, outside ``fp``."""
+    H, W = fp.shape
+    f = 4 if max(H, W) > 1600 else 2
+    h, w = max(1, H // f), max(1, W // f)
+    small = cv2.resize(lab, (w, h), interpolation=cv2.INTER_AREA)
+    ys, xs = np.mgrid[0:h, 0:w]
+    ref = model.at((xs.ravel() + 0.5) * W / w - 0.5, (ys.ravel() + 0.5) * H / h - 0.5).reshape(h, w, 3)
+    diff = np.sqrt(((small - ref) ** 2).sum(axis=2))
+    paint = ((diff > 8.0) & (small[..., 0] > 30.0)).astype(np.uint8)
+    # Drop text strokes, thin lines and edges: paint fills areas.
+    paint = cv2.morphologyEx(paint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    paint = cv2.resize(paint, (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+    n, comp, stats, _ = cv2.connectedComponentsWithStats(paint.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return np.zeros_like(fp)
+    r = int(np.ceil(2 * width)) + 1
+    touch = cv2.dilate(fp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))).astype(bool)
+    hit = np.bincount(comp[touch], minlength=n) > 0
+    keep = hit & (stats[:, cv2.CC_STAT_AREA] >= min_area)
+    keep[0] = False
+    return keep[comp] & ~fp
