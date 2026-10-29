@@ -12,7 +12,7 @@ import type {
 } from "./types";
 import type { FeatureCollection } from "geojson";
 
-const BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? "";
+const BASE = ((import.meta.env.VITE_API_URL as string | undefined) ?? "").replace(/\/+$/, "");
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
