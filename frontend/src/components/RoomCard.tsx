@@ -7,7 +7,7 @@ import type { RoomClick } from "./MapView";
 import { KIND_COLORS } from "./MapView";
 import { useToast } from "./Toast";
 
-const KINDS: RoomKind[] = ["room", "corridor", "stair", "elevator", "restroom", "unknown"];
+const KINDS: RoomKind[] = ["room", "corridor", "stair", "elevator", "restroom", "outdoor", "unknown"];
 
 /** Details for the clicked room, with quick fixes for the converter's mistakes. */
 export default function RoomCard({ room, buildingName, onClose }: { room: RoomClick; buildingName?: string; onClose: () => void }) {

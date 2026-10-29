@@ -32,6 +32,7 @@ export const KIND_COLORS: Record<string, string> = {
   stair: "#fcd34d",
   elevator: "#c4b5fd",
   restroom: "#7dd3fc",
+  outdoor: "#86efac",
   unknown: "#c7d2fe",
 };
 

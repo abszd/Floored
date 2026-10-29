@@ -21,3 +21,8 @@ def test_round_trip_dict():
     conv = get_converter("legacy").convert(png)
     again = ConversionResult.from_dict(conv.to_dict())
     assert [r.polygon for r in again.rooms] == [r.polygon for r in conv.rooms]
+
+
+def test_outdoor_kind_survives_round_trip():
+    d = {"image_size": [10, 10], "rooms": [{"id": "t", "polygon": [[0, 0], [5, 0], [5, 5]], "kind": "outdoor"}]}
+    assert ConversionResult.from_dict(d).rooms[0].kind == "outdoor"

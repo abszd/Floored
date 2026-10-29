@@ -1,7 +1,7 @@
 import type { FeatureCollection, Geometry } from "geojson";
 
 export type FloorStatus = "pending" | "processing" | "placed" | "needs_review" | "error";
-export type RoomKind = "room" | "corridor" | "stair" | "elevator" | "restroom" | "unknown";
+export type RoomKind = "room" | "corridor" | "stair" | "elevator" | "restroom" | "outdoor" | "unknown";
 
 export interface Placement {
   center_lon: number;
