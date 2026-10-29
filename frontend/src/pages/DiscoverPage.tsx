@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ExternalLink, Globe, Play, Plus, RefreshCw, Search, Trash2, X, Inbox, Wand2, MapPin } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
@@ -18,7 +18,12 @@ const TABS = [
 
 export default function DiscoverPage() {
   const [tab, setTab] = useState("review");
-  const [addingSource, setAddingSource] = useState(false);
+  const [params, setParams] = useSearchParams();
+  const [addingSource, setAddingSourceState] = useState(params.get("add") === "1");
+  const setAddingSource = (v: boolean) => {
+    setAddingSourceState(v);
+    if (!v && params.has("add")) setParams({}, { replace: true });
+  };
   const [zoom, setZoom] = useState<Candidate | null>(null);
   const sources = useQuery({ queryKey: ["sources"], queryFn: api.sources });
   const status = TABS.find((t) => t.key === tab)!.status;

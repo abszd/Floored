@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import maplibregl, { type ImageSource, type Map as MLMap } from "maplibre-gl";
+import mapboxgl, { type ImageSource, type Map as MBMap } from "mapbox-gl";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { FlipHorizontal2, Magnet, RotateCw, Save, Undo2, X, Copy, Lock, Unlock } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
@@ -9,7 +9,7 @@ import { useToast } from "./Toast";
 import { Spinner } from "./ui";
 
 interface Props {
-  map: MLMap;
+  map: MBMap;
   floor: Floor;
   building: Building;
   onClose: () => void;
@@ -47,7 +47,7 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
   pRef.current = placement;
   const uniformRef = useRef(uniform);
   uniformRef.current = uniform;
-  const markers = useRef<{ move: maplibregl.Marker; rotate: maplibregl.Marker; corners: maplibregl.Marker[] } | null>(null);
+  const markers = useRef<{ move: mapboxgl.Marker; rotate: mapboxgl.Marker; corners: mapboxgl.Marker[] } | null>(null);
 
   // Image overlay + footprint highlight + handles.
   useEffect(() => {
@@ -55,14 +55,16 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
     if (!url) return;
     const absolute = new URL(url, window.location.href).toString();
     map.addSource("plan-image", { type: "image", url: absolute, coordinates: P.corners(pRef.current) });
-    map.addLayer({ id: "plan-image", type: "raster", source: "plan-image", paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } });
+    const slot = map.getStyle()?.imports?.length ? { slot: "middle" as const } : {};
+    map.addLayer({ id: "plan-image", type: "raster", source: "plan-image", ...slot, paint: { "raster-opacity": opacity, "raster-fade-duration": 0 } });
     if (building.footprint) {
       map.addSource("plan-footprint", { type: "geojson", data: { type: "Feature", geometry: building.footprint, properties: {} } });
       map.addLayer({
         id: "plan-footprint",
         type: "line",
         source: "plan-footprint",
-        paint: { "line-color": "#f43f5e", "line-width": 2, "line-dasharray": [2, 1.5] },
+        ...slot,
+        paint: { "line-color": "#f43f5e", "line-width": 2, "line-dasharray": [2, 1.5], "line-emissive-strength": 1 },
       });
     }
 
@@ -72,14 +74,14 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
       d.title = title;
       return d;
     };
-    const move = new maplibregl.Marker({ element: el("handle-move", "Drag to move"), draggable: true })
+    const move = new mapboxgl.Marker({ element: el("handle-move", "Drag to move"), draggable: true })
       .setLngLat([pRef.current.center_lon, pRef.current.center_lat])
       .addTo(map);
-    const rotate = new maplibregl.Marker({ element: el("handle-rotate", "Drag to rotate"), draggable: true })
+    const rotate = new mapboxgl.Marker({ element: el("handle-rotate", "Drag to rotate"), draggable: true })
       .setLngLat(P.rotateHandle(pRef.current))
       .addTo(map);
     const corners = P.corners(pRef.current).map((c, i) => {
-      const m = new maplibregl.Marker({ element: el("", "Drag to resize"), draggable: true }).setLngLat(c).addTo(map);
+      const m = new mapboxgl.Marker({ element: el("", "Drag to resize"), draggable: true }).setLngLat(c).addTo(map);
       m.on("drag", () => {
         const { lng, lat } = m.getLngLat();
         setPlacement(P.withCornerAt(pRef.current, i, lng, lat, uniformRef.current));
@@ -127,7 +129,7 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
   // Fly to the plan when the editor opens.
   useEffect(() => {
     const cs = P.corners(pRef.current);
-    const b = new maplibregl.LngLatBounds(cs[0], cs[0]);
+    const b = new mapboxgl.LngLatBounds(cs[0], cs[0]);
     cs.forEach((c) => b.extend(c));
     map.fitBounds(b, { padding: { top: 80, bottom: 80, left: 420, right: 80 }, maxZoom: 19.5, duration: 600 });
   }, [map, floor.id]);
@@ -185,7 +187,7 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
         {fitInfo && fitInfo.iou != null && (
           <div className={`rounded-lg px-3 py-2 text-sm ${fitInfo.iou >= 0.75 && !fitInfo.ambiguous ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
             Overlap with the building outline: <b>{Math.round(fitInfo.iou * 100)}%</b>
-            {fitInfo.ambiguous && <div className="mt-0.5 text-xs">The building is symmetric, so check the plan isn't turned around. Use “Rotate 90°” if it is.</div>}
+            {fitInfo.ambiguous && <div className="mt-0.5 text-xs">The building is symmetric, so check the plan isn't turned around. If it is, press “Rotate 90°” twice.</div>}
           </div>
         )}
 

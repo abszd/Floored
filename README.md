@@ -37,7 +37,7 @@ the product around it:
 | Converter contract | `backend/floored/converters/base.py` | `image bytes → {image_size, outline, rooms[{id, polygon, holes, label, kind, area_px}], walls, doors, scale_hint}` in original-image pixels. `FLOORED_CONVERTER=auto` uses `converter/` when installed, else the legacy port. |
 | Placement | `backend/floored/placement/` | A placement is *centre, compass bearing, width and height in metres*: the old two-corner "GeoJSON resizer" plus rotation. `fit.py` tries the four axis alignments between the plan outline and the OSM footprint and polishes each with Nelder–Mead to maximise overlap (IoU), with a small penalty on non-uniform scale. Symmetric buildings are flagged for review because they fit equally well turned 180°. |
 | API | `backend/floored/api/app.py` | FastAPI; SQLite by default; background jobs for crawling and conversion. |
-| UI | `frontend/` | React + MapLibre GL (no map API key needed). |
+| UI | `frontend/` | React + Mapbox GL JS: 3D buildings, satellite and night basemaps, a cutaway 3D view of the floors, and a placement editor. |
 
 ## Running it
 
@@ -54,6 +54,7 @@ floored serve                      # http://127.0.0.1:8000
 # UI (in another terminal)
 cd frontend
 npm install
+echo "VITE_MAPBOX_TOKEN=pk.your-token" > .env.local
 npm run dev                        # http://localhost:5173, proxies /api to :8000
 ```
 
@@ -82,7 +83,24 @@ Environment variables (all optional):
 | `FLOORED_AUTO_APPROVE` | `0.85` | Match confidence above which a found plan is processed without review. |
 | `FLOORED_CRAWL_DELAY` | `1.0` | Seconds between requests to the same site. |
 | `FLOORED_WORKERS` | `2` | Background job threads. |
-| `VITE_MAP_STYLE` (frontend) | OpenFreeMap Positron | Any MapLibre style URL. |
+| `VITE_MAPBOX_TOKEN` (frontend) | none | Public Mapbox token; the map won't draw without one. |
+| `VITE_API_URL` (frontend) | same origin | Where the API is, when the UI is hosted separately (GitHub Pages). |
+| `FLOORED_CORS_ORIGINS` | `*` | Set to the UI's origin in production, e.g. `https://abszd.github.io`. |
+
+## Deploying
+
+**UI on GitHub Pages.** `.github/workflows/pages.yml` builds `frontend/` and publishes it
+whenever `main` changes (so every merged PR), or on demand from the Actions tab. One-time setup:
+
+1. Settings → Pages → *Build and deployment* → Source: **GitHub Actions**.
+2. Settings → Secrets and variables → Actions:
+   - secret `MAPBOX_TOKEN`: a public Mapbox token, URL-restricted to `https://abszd.github.io`;
+   - variable `FLOORED_API_URL`: where the API runs, e.g. `https://floored-api.fly.dev`.
+
+**API.** Pages only hosts static files, so the API runs elsewhere. The `Dockerfile` at the repo
+root builds it (with the rebuilt converter when `converter/` is present); any container host works
+(Fly.io, Render, Railway, a VM). Give it a persistent volume at `/data` and set
+`FLOORED_CORS_ORIGINS=https://abszd.github.io` and `FLOORED_USER_AGENT="Floored (you@example.com)"`.
 
 ## Using it
 
