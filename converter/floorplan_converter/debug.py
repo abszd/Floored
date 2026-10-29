@@ -34,7 +34,7 @@ def render(bgr, sty, tr, W, gr, soft, labels, rooms, scale) -> dict:
     t[tr.mask] = (0, 0, 255)
     for it in tr.items:
         cv2.polylines(t, [np.round(it.quad).astype(np.int32)], True, (255, 120, 0), 1)
-    out["1_text"] = _png(t)
+    out["text"] = _png(t)
 
     # 2. Walls: heavy walls black, light walls dark gray, minor lines light gray, removed
     #    clutter pink,
@@ -46,7 +46,7 @@ def render(bgr, sty, tr, W, gr, soft, labels, rooms, scale) -> dict:
     v[W.strong] = (0, 0, 0)
     v[soft] = (255, 150, 0)
     v[gr.mask] = (0, 0, 230)
-    out["2_walls"] = _png(v)
+    out["walls"] = _png(v)
 
     # 3. Rooms over the input.
     over = bgr.copy()
@@ -65,7 +65,7 @@ def render(bgr, sty, tr, W, gr, soft, labels, rooms, scale) -> dict:
         tag = r.number or r.name or r.id
         cv2.putText(over, str(tag)[:18], (int(cx) - 20, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
         cv2.putText(over, str(tag)[:18], (int(cx) - 20, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-    out["3_rooms"] = _png(over)
+    out["rooms"] = _png(over)
 
     # 4. Final polygons only, coloured by kind.
     poly = np.full((h, w, 3), 255, np.uint8)
@@ -74,5 +74,5 @@ def render(bgr, sty, tr, W, gr, soft, labels, rooms, scale) -> dict:
         holes = [np.round(np.array(hh) * scale - 0.5).astype(np.int32) for hh in r.holes]
         cv2.fillPoly(poly, [pts] + holes, KIND_COLORS.get(r.kind, (180, 180, 180)))
         cv2.polylines(poly, [pts], True, (60, 60, 60), 1, cv2.LINE_AA)
-    out["4_polygons"] = _png(poly)
+    out["polygons"] = _png(poly)
     return out

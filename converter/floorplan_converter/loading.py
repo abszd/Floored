@@ -73,10 +73,21 @@ def _normalize_array(img: np.ndarray) -> np.ndarray:
 
 
 def _render_pdf(data: bytes, page: int, dpi: int) -> np.ndarray:
+    """Render one PDF page with pypdfium2 or, failing that, PyMuPDF."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        pdfium = None
+    if pdfium is not None:
+        doc = pdfium.PdfDocument(data)
+        if page >= len(doc):
+            raise InputError(f"PDF has {len(doc)} page(s), page {page} requested")
+        pil = doc[page].render(scale=dpi / 72.0).to_pil()
+        return _normalize_array(np.asarray(pil.convert("RGB"))[..., ::-1])
     try:
         import fitz  # PyMuPDF
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise InputError("PDF input needs PyMuPDF: pip install 'floorplan-converter[pdf]'") from exc
+        raise InputError("PDF input needs pypdfium2 or PyMuPDF: pip install 'floorplan-converter[pdf]'") from exc
     doc = fitz.open(stream=data, filetype="pdf")
     if page >= doc.page_count:
         raise InputError(f"PDF has {doc.page_count} page(s), page {page} requested")

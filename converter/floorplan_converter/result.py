@@ -71,8 +71,13 @@ class ConversionResult:
             "outline": self.outline,
             "rooms": [asdict(r) for r in self.rooms],
             "footprint": self.footprint,
-            "walls": [asdict(w) for w in self.walls],
-            "doors": [asdict(x) for x in self.doors],
+            # Walls and doors as plain polylines (the shared contract), with their
+            # widths and kinds in parallel lists.
+            "walls": [w.polyline for w in self.walls],
+            "wall_thickness_px": [w.thickness_px for w in self.walls],
+            "doors": [x.polyline for x in self.doors],
+            "door_widths_px": [x.width_px for x in self.doors],
+            "door_kinds": [x.kind for x in self.doors],
             "texts": [asdict(t) for t in self.texts],
             "scale_hint": self.scale_hint,
             "meta": self.meta,

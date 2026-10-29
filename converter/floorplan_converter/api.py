@@ -304,7 +304,7 @@ def _crop_box(bbox, scale: float, shape, opts: ConverterOptions):
         new_scale = min(opts.min_working_size / longest, 3.0)
     else:
         new_scale = 1.0
-    if new_scale < 1.4 * scale:
+    if new_scale < 1.2 * scale:
         return None
     return x0, y0, x1, y1
 

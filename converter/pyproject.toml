@@ -1,0 +1,37 @@
+[project]
+name = "floorplan-converter"
+dynamic = ["version"]
+description = "Turn floor plan images into room polygons, a building outline, walls and doors."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "opencv-python-headless>=4.9",
+    "shapely>=2.0",
+    "pillow>=10.0",
+    # Reads room names and numbers. Without it text is still removed from the walls,
+    # but rooms come back unlabelled.
+    "rapidocr-onnxruntime>=1.2",
+]
+
+[project.optional-dependencies]
+pdf = ["pypdfium2>=4.25"]
+dev = ["pytest>=8.0", "pypdfium2>=4.25"]
+
+[project.scripts]
+floorplan-convert = "floorplan_converter.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "floorplan_converter.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["floorplan_converter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
