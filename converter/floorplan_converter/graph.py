@@ -16,6 +16,7 @@ import numpy as np
 from . import skeleton as skel
 
 _OFFSETS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+_PREF = (1, 3, 4, 6, 0, 2, 5, 7)  # indices into _OFFSETS: 4-neighbours, then diagonals
 
 
 @dataclass
@@ -156,55 +157,71 @@ def _trace(sk: np.ndarray):
     pix_branch[is_node] = -2
     branches = []
     endpoint = sk & (nc <= 1)
-
-    def nbrs(y, x):
-        for dy, dx in _OFFSETS:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < H and 0 <= nx < W and sk[ny, nx]:
-                yield ny, nx
-
+    ys, xs = np.nonzero(sk)
+    n = len(ys)
+    if n == 0:
+        return branches, pix_branch
+    # The walk runs over plain Python lists of skeleton pixels and their neighbours
+    # (numpy element access is far slower per pixel).
+    cid = np.full((H + 2, W + 2), -1, np.int64)
+    cid[ys + 1, xs + 1] = np.arange(n)
+    nbl = np.stack([cid[ys + 1 + dy, xs + 1 + dx] for dy, dx in _OFFSETS], axis=1).tolist()
+    node = is_node[ys, xs].tolist()
+    endp = endpoint[ys, xs].tolist()
     _, cluster = cv2.connectedComponents(is_node.astype(np.uint8), connectivity=8)
+    clus = cluster[ys, xs].tolist()
+    owner = [-2 if v else -1 for v in node]
+    xl, yl = xs.tolist(), ys.tolist()
+    pref = _PREF  # 4-neighbours first, so the walk does not cut corners
 
-    def step_order(cy, cx, cands):
-        # Prefer 4-neighbours so the walk does not cut corners.
-        return sorted(cands, key=lambda q: abs(q[0] - cy) + abs(q[1] - cx))
-
-    for y0, x0 in np.argwhere(is_node):
-        c0 = cluster[y0, x0]
-        for y1, x1 in list(nbrs(y0, x0)):
-            if is_node[y1, x1] or pix_branch[y1, x1] != -1:
+    for p0 in range(n):
+        if not node[p0]:
+            continue
+        c0 = clus[p0]
+        for p1 in nbl[p0]:
+            if p1 < 0 or node[p1] or owner[p1] != -1:
                 continue
             idx = len(branches)
-            path = [(y0, x0), (y1, x1)]
-            pix_branch[y1, x1] = idx
-            prev, cur = (y0, x0), (y1, x1)
-            end_node = None
+            path = [p0, p1]
+            owner[p1] = idx
+            prev, cur = p0, p1
+            end_node = -1
             while True:
-                node_n = [q for q in nbrs(*cur) if is_node[q] and q != prev
-                          and not (cluster[q] == c0 and len(path) <= 2)]
-                if node_n:
-                    end_node = step_order(cur[0], cur[1], node_n)[0]
+                nb = nbl[cur]
+                nxt = -1
+                for k in pref:
+                    q = nb[k]
+                    if q >= 0 and node[q] and q != prev and not (clus[q] == c0 and len(path) <= 2):
+                        end_node = q
+                        break
+                if end_node >= 0:
                     break
-                free_n = [q for q in nbrs(*cur) if not is_node[q] and pix_branch[q] == -1]
-                if not free_n:
+                for k in pref:
+                    q = nb[k]
+                    if q >= 0 and not node[q] and owner[q] == -1:
+                        nxt = q
+                        break
+                if nxt < 0:
                     break
-                nxt = step_order(cur[0], cur[1], free_n)[0]
-                pix_branch[nxt] = idx
+                owner[nxt] = idx
                 path.append(nxt)
                 prev, cur = cur, nxt
-            if end_node is not None:
+            if end_node >= 0:
                 path.append(end_node)
-            pts = np.array([(x, y) for y, x in path], np.float64)
-            a_free = bool(endpoint[y0, x0])
-            b_free = True if end_node is None else bool(endpoint[end_node])
-            branches.append(Branch(pts, a_free, b_free))
+            pts = np.array([(xl[i], yl[i]) for i in path], np.float64)
+            b_free = True if end_node < 0 else endp[end_node]
+            branches.append(Branch(pts, endp[p0], b_free))
     # Direct node-to-node links (adjacent junction pixels of different clusters) need no
     # branch; endpoints touching a junction become zero-length branches.
-    for y0, x0 in np.argwhere(endpoint & (nc == 1)):
-        for y1, x1 in nbrs(y0, x0):
-            if is_node[y1, x1] and not endpoint[y1, x1]:
-                branches.append(Branch(np.array([(x0, y0), (x1, y1)], np.float64), True, False))
-                pix_branch[y0, x0] = len(branches) - 1
+    ncl = nc[ys, xs].tolist()
+    for p0 in range(n):
+        if not (endp[p0] and ncl[p0] == 1):
+            continue
+        for p1 in nbl[p0]:
+            if p1 >= 0 and node[p1] and not endp[p1]:
+                branches.append(Branch(np.array([(xl[p0], yl[p0]), (xl[p1], yl[p1])], np.float64), True, False))
+                owner[p0] = len(branches) - 1
+    pix_branch[ys, xs] = owner
     # Isolated rings (no nodes at all).
     rest = sk & (pix_branch == -1)
     if rest.any():

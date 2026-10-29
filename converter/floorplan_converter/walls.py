@@ -60,6 +60,11 @@ def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h
     kept, bbox = _main_plan(kept, width0)
 
     g = graph.build(kept, coverage, prune_len)
+    dim = _tick_dimensions(g, kept, width0)
+    if dim.any():
+        removed |= dim & kept
+        kept = _drop_specks(kept & ~dim, max(4, int(width0 * width0)))
+        g = graph.build(kept, coverage, prune_len)
     # Door swings: quarter circles drawn from a jamb, with the door leaf as a radius.
     # They are annotation whatever their line weight, and their radius is the door width.
     swing_mask, radii = _door_swings(g, kept, width0, float(np.hypot(*kept.shape)))
@@ -98,16 +103,29 @@ def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h
         kept = _drop_specks(kept & ~erase, max(4, int(width0 * width0)))
         g = graph.build(kept, coverage, prune_len)
 
-    if tau > 0 and g.branches:
-        # Free-standing groups of light lines (a table with its chairs, a bed, a desk
-        # cluster) are furniture: drop them whole, however large the group is.
-        light_px = _branch_lut(g, [b.width < tau for b in g.branches])[g.owner + 2]
-        heavy_px = kept & ~light_px & (g.owner != -1)
+    if g.branches:
+        # Free-standing furniture: groups of light lines (a table with its chairs, a bed,
+        # a desk cluster) dropped whole however large, and small closed outlines of any
+        # weight (a table drawn at wall weight would otherwise become a room).
         n, lab, stats, _ = cv2.connectedComponentsWithStats(kept.astype(np.uint8), connectivity=8)
-        has_heavy = np.bincount(lab[heavy_px], minlength=n) >= max(4, int(width0 * width0))
         diag = np.hypot(stats[:, 2], stats[:, 3])
+        if tau > 0:
+            light_px = _branch_lut(g, [b.width < tau for b in g.branches])[g.owner + 2]
+            heavy_px = kept & ~light_px & (g.owner != -1)
+            has_heavy = np.bincount(lab[heavy_px], minlength=n) >= max(4, int(width0 * width0))
+        else:
+            has_heavy = np.ones(n, bool)
         furn = (~has_heavy) & (diag <= 4.0 * door)
-        furn[0] = False
+        main = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1 if n > 1 else 0
+        for i in np.nonzero(has_heavy & (diag <= 4.0 * door))[0]:
+            if i == main or i == 0:
+                continue
+            x, y, bw, bh = (int(v) for v in stats[i, :4])
+            sub = lab[y:y + bh, x:x + bw] == i
+            if (ndi.binary_fill_holes(sub) & ~sub).sum() >= max(16, 4 * width0 * width0):
+                furn[i] = True
+        furn[0] = furn[main] = False
+        furn |= _dimension_lines(lab, stats, main, door, width0)
         if furn.any():
             drop_px = furn[lab]
             removed |= drop_px
@@ -230,6 +248,124 @@ def _fit_circle(pts: np.ndarray):
     r = float(np.sqrt(r2))
     resid = float(np.sqrt(np.mean((np.hypot(x - c[0], y - c[1]) - r) ** 2)))
     return c, r, resid
+
+
+def plan_bbox(ink: np.ndarray) -> tuple:
+    """Quick estimate of the plan's extent (x0, y0, x1, y1) on the sheet, before text is
+    found: the main cluster of linework, without legends, frames or title blocks."""
+    base = _drop_specks(ink, 4)
+    width0, _ = _stroke_widths(base)
+    kept, _ = _remove_clutter(base, width0, 0.0)
+    _, bbox = _main_plan(kept, width0)
+    return bbox
+
+
+def _tick_dimensions(g, mask: np.ndarray, width: float) -> np.ndarray:
+    """Dimension lines marked with architectural ticks (short 45-degree slashes through
+    the line at each measured point). Returns the pixels of the lines between ticks, the
+    ticks, and the extension lines hanging from them."""
+    H, W = mask.shape
+    erase = np.zeros((H, W), np.uint8)
+    tick_max = max(10.0, 5.0 * width)
+    halves = []  # (root, unit direction out of the root, branch index)
+    for i, b in enumerate(g.branches):
+        if b.a_free == b.b_free or b.length > tick_max or len(b.pts) < 3:
+            continue
+        root, tip = (b.pts[-1], b.pts[0]) if b.a_free else (b.pts[0], b.pts[-1])
+        v = (tip - root).astype(np.float64)
+        n = float(np.hypot(*v))
+        if n < 0.85 * b.length or n < 3:
+            continue  # not straight
+        halves.append((root.astype(np.float64), v / n, i))
+    if len(halves) < 4:
+        return erase.astype(bool)
+    tree = cKDTree(np.array([h[0] for h in halves]))
+    ticks = []  # (centre, slash axis, branch indices)
+    done = set()
+    # The two halves of a slash may hang from two junctions a few pixels apart (where
+    # the slash and an extension line cross the dimension line).
+    for a, b in sorted(tree.query_pairs(max(6.0, 2.0 * width)),
+                       key=lambda ab: float(np.hypot(*(halves[ab[0]][0] - halves[ab[1]][0])))):
+        if a in done or b in done:
+            continue
+        if halves[a][1] @ halves[b][1] < -0.85:
+            ticks.append(((halves[a][0] + halves[b][0]) / 2, halves[a][1], (halves[a][2], halves[b][2])))
+            done.update((a, b))
+    if len(ticks) < 2:
+        return erase.astype(bool)
+    thick = max(3, int(np.ceil(width)) + 2)
+    used = set()
+    lines = []
+    for i in range(len(ticks)):
+        for j in range(i + 1, len(ticks)):
+            ci, cj = ticks[i][0], ticks[j][0]
+            v = cj - ci
+            dist = float(np.hypot(*v))
+            if dist < 3.0 * tick_max:
+                continue
+            u = v / dist
+            if not all(0.45 <= abs(float(u @ t[1])) <= 0.9 for t in (ticks[i], ticks[j])):
+                continue
+            k = np.linspace(0.0, 1.0, max(8, int(dist)))
+            xs = np.clip(np.round(ci[0] + v[0] * k).astype(int), 0, W - 1)
+            ys = np.clip(np.round(ci[1] + v[1] * k).astype(int), 0, H - 1)
+            if mask[ys, xs].mean() < 0.97:
+                continue
+            cv2.line(erase, tuple(int(round(c)) for c in ci), tuple(int(round(c)) for c in cj), 1, thick)
+            used.update((i, j))
+            lines.append(u)
+    if not used:
+        return erase.astype(bool)
+    flags = np.zeros(len(g.branches), bool)
+    centres = np.array([ticks[i][0] for i in used])
+    for i in used:
+        flags[list(ticks[i][2])] = True
+    # Extension lines: free-ended straight branches leaving a tick square to the line.
+    ctree = cKDTree(centres)
+    for k, b in enumerate(g.branches):
+        if b.a_free == b.b_free or flags[k] or b.length > 12.0 * tick_max:
+            continue
+        root, tip = (b.pts[-1], b.pts[0]) if b.a_free else (b.pts[0], b.pts[-1])
+        if not ctree.query_ball_point(root, max(6.0, 2.0 * width)):
+            continue
+        v = (tip - root).astype(np.float64)
+        n = float(np.hypot(*v))
+        if n >= 0.9 * b.length and min(abs(float(v @ u)) / n for u in lines) <= 0.2:
+            flags[k] = True
+    erase |= _branch_lut(g, flags)[g.owner + 2].astype(np.uint8)
+    return erase.astype(bool) & mask
+
+
+def _dimension_lines(lab: np.ndarray, stats: np.ndarray, main: int, door: float, width: float) -> np.ndarray:
+    """Dimension chains standing just outside the building: long, narrow, open line
+    groups (the dimension line with its ticks and extension lines) that lie outside the
+    main wall network's outline. Close enough to the walls, they would otherwise be
+    bridged into the footprint as a long thin room."""
+    n = len(stats)
+    out = np.zeros(n, bool)
+    if main <= 0 or n <= 2:
+        return out
+    x, y, bw, bh = (int(v) for v in stats[main, :4])
+    pad = int(np.ceil(1.2 * door))
+    H, W = lab.shape
+    x0, y0, x1, y1 = max(0, x - pad), max(0, y - pad), min(W, x + bw + pad), min(H, y + bh + pad)
+    m = (lab[y0:y1, x0:x1] == main).astype(np.uint8)
+    r = max(2, int(round(0.6 * door)))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2 * r + 1, 2 * r + 1)))
+    inside = np.zeros((H, W), bool)
+    inside[y0:y1, x0:x1] = ndi.binary_fill_holes(m > 0)
+    for i in range(1, n):
+        if i == main:
+            continue
+        cx, cy, cw, ch, area = (int(v) for v in stats[i])
+        if max(cw, ch) < 3.0 * door or min(cw, ch) > 1.2 * door:
+            continue
+        sub = lab[cy:cy + ch, cx:cx + cw] == i
+        if (ndi.binary_fill_holes(sub) & ~sub).sum() >= max(16, 4 * width * width):
+            continue
+        if (sub & inside[cy:cy + ch, cx:cx + cw]).sum() <= 0.3 * area:
+            out[i] = True
+    return out
 
 
 def _branch_lut(g, flags) -> np.ndarray:
@@ -450,8 +586,7 @@ def _free_components(mask: np.ndarray):
     free = (~mask).astype(np.uint8)
     n, lab, stats, _ = cv2.connectedComponentsWithStats(free, connectivity=4)
     dt = cv2.distanceTransform(free, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    idx = np.arange(n)
-    rmax = np.asarray(ndi.maximum(dt, lab, idx))
+    rmax = _label_max(dt, lab, n, cross=True)
     x, y, bw, bh, area = (stats[:, i] for i in range(5))
     H, W = mask.shape
     border = (x == 0) | (y == 0) | (x + bw >= W) | (y + bh >= H)
@@ -485,8 +620,8 @@ def _solidify(mask: np.ndarray, text_h: float):
         cand = (~border) & (rmax <= r_fill) & (elong >= 2.0)
         cand[0] = False
         # Long channels are the wall network itself, never a stack of treads.
-        short = cand & (elong < 8.0) & (length < 0.12 * span)
-        fill |= cand & ~(short & _stacked(lab, short, rmax, area))
+        short = cand & (length < 0.12 * span)
+        fill |= cand & ~(short & _stacked(lab, short, rmax, length))
     # The gaps between hatching lines, and other slivers and specks too narrow to be
     # anything but the inside of a wall. (Stair treads and furniture leave wider cells.)
     fill |= (~border) & (rmax <= 2.0)
@@ -497,9 +632,10 @@ def _solidify(mask: np.ndarray, text_h: float):
     return mask | fill[lab], double_line
 
 
-def _stacked(lab: np.ndarray, cand: np.ndarray, rmax: np.ndarray, area: np.ndarray, gap: int = 3) -> np.ndarray:
-    """Candidate channels that sit in a stack of similar channels a line's width apart:
-    the gaps between stair treads (or a hatched band), not a wall's inside."""
+def _stacked(lab: np.ndarray, cand: np.ndarray, rmax: np.ndarray, length: np.ndarray, gap: int = 3) -> np.ndarray:
+    """Candidate channels that lie side by side with similar channels a line's width
+    apart: the gaps between stair treads (or a hatched band), not a wall's inside. Pieces
+    of a wall's inside meet end to end, so they touch only over a wall's width."""
     out = np.zeros(len(cand), bool)
     ids = np.nonzero(cand)[0]
     if ids.size < 3:
@@ -515,14 +651,32 @@ def _stacked(lab: np.ndarray, cand: np.ndarray, rmax: np.ndarray, area: np.ndarr
         y0, y1 = max(0, sl[0].start - gap), min(H, sl[0].stop + gap)
         x0, x1 = max(0, sl[1].start - gap), min(W, sl[1].stop + gap)
         sub = clab[y0:y1, x0:x1]
-        ring = cv2.dilate((sub == i).astype(np.uint8), k).astype(bool)
-        nb = np.unique(sub[ring])
-        nb = nb[(nb > 0) & (nb != i)]
-        similar = [j for j in nb if 0.67 <= rmax[j] / max(rmax[i], 1e-6) <= 1.5
-                   and 0.5 <= area[j] / max(area[i], 1.0) <= 2.0]
-        if len(similar) >= 2:
+        ring = cv2.dilate((sub == i).astype(np.uint8), k).astype(bool) & (sub != i)
+        nb, cnt = np.unique(sub[ring], return_counts=True)
+        side = 0
+        for j, c in zip(nb, cnt):
+            if j <= 0 or not (0.67 <= rmax[j] / max(rmax[i], 1e-6) <= 1.5):
+                continue
+            # Contact length along the neighbour, from the pixels of it within reach.
+            if c / max(1.0, 2.0 * rmax[j]) >= 0.5 * min(length[i], length[j]):
+                side += 1
+        if side >= 2:
             out[i] = True
     return out
+
+
+def _label_max(values: np.ndarray, labels: np.ndarray, n: int, cross: bool = False) -> np.ndarray:
+    """Per-label maximum of ``values`` (label 0 included). Only local maxima can hold a
+    label's maximum, so only those are reduced; neighbouring pixels of other labels are
+    masked out (``cross`` for 4-connected labels, which may touch diagonally)."""
+    v = np.where(labels > 0, values, -np.inf).astype(np.float32)
+    fp = ndi.generate_binary_structure(2, 1 if cross else 2)
+    peak = (labels > 0) & (v >= ndi.maximum_filter(v, footprint=fp))
+    out = np.full(n, -np.inf)
+    np.maximum.at(out, labels[peak], v[peak])
+    if n:
+        out[0] = float(values[labels == 0].max()) if (labels == 0).any() else -np.inf
+    return np.where(np.isfinite(out), out, 0.0)
 
 
 def _weighted_percentile(values, weights, q):
@@ -578,11 +732,11 @@ def _remove_clutter(mask: np.ndarray, width: float, text_h: float):
     small = small[small > 0]
     if small.size:
         dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
-        maxdt = np.asarray(ndi.maximum(dt, lab, small))
+        maxdt = _label_max(dt, lab, n)[small]
         thick = (2 * maxdt - 1) >= 0.8 * width
         if thick.any():
             near_dist = cv2.distanceTransform((~big[lab]).astype(np.uint8), cv2.DIST_L2, 3)
-            mind = np.asarray(ndi.minimum(near_dist, lab, small))
+            mind = -_label_max(-near_dist, lab, n)[small]
             reach = max(4.0 * width, 1.2 * (text_h or 10.0))
             ok = thick & (mind <= reach)
             keep[small[ok]] = True
@@ -635,9 +789,31 @@ def _main_plan(mask: np.ndarray, width: float):
     grouped = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
     if f > 1:
         grouped = cv2.resize(grouped, (W, H), interpolation=cv2.INTER_NEAREST)
-    _, glab = cv2.connectedComponents(grouped, connectivity=8)
+    ng, glab = cv2.connectedComponents(grouped, connectivity=8)
     ys, xs = np.nonzero(lab == main)
-    out = mask & (glab == glab[ys[0], xs[0]])
+    g_main = int(glab[ys[0], xs[0]])
+    keep = [g_main]
+    if ng > 2:
+        # Other wings drawn apart on the same sheet: groups with a comparable amount of
+        # linework, enclosing comparable floor area, drawn at the same wall weight.
+        dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
+        gl = np.where(mask, glab, 0)
+        length = np.bincount(gl.ravel(), minlength=ng).astype(np.float64)
+
+        def stats_of(k):
+            sl = ndi.find_objects((gl == k).astype(np.int32))[0]
+            sub = gl[sl] == k
+            filled = float(ndi.binary_fill_holes(sub).sum() - sub.sum())
+            return filled, float(np.percentile(dt[sl][sub], 90))
+
+        f_main, w_main = stats_of(g_main)
+        for k in range(1, ng):
+            if k == g_main or length[k] < 0.2 * length[g_main]:
+                continue
+            f_k, w_k = stats_of(k)
+            if f_k >= 0.1 * f_main and w_k >= 0.7 * w_main:
+                keep.append(k)
+    out = mask & np.isin(glab, keep)
     # Dimension lines: long, thin, separate components lying outside the building's extent.
     mx0, my0, mw, mh = (float(v) for v in stats[main, :4])
     for i in range(1, n):

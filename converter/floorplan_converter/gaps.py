@@ -239,7 +239,8 @@ def close_gaps(mask: np.ndarray, g, wall_w: float, text_h: float, max_gap_doors:
         # Lateral offset of each tip from the other's centre line.
         perp_i = abs(dirs[i][0] * v[1] - dirs[i][1] * v[0])
         perp_j = abs(dirs[j][0] * v[1] - dirs[j][1] * v[0])
-        tol = max(0.9 * max(ends[i].width, ends[j].width), 2.5)
+        # A few degrees of slack: jambs are rarely drawn on exactly one line.
+        tol = max(0.9 * max(ends[i].width, ends[j].width), 2.5) + 0.05 * dist
         if max(perp_i, perp_j) > tol:
             return None
         return dist, ci, cj

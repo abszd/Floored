@@ -21,6 +21,9 @@ class ConverterOptions:
     #: Page to render when the input is a PDF (0-based). Needs PyMuPDF.
     pdf_page: int = 0
     pdf_dpi: int = 200
+    #: When the plan covers only part of the sheet, run again on a crop around it so
+    #: its thin lines get more working resolution (coordinates stay in full-image pixels).
+    auto_crop: bool = True
 
     # --- text --------------------------------------------------------------
     #: "auto" (RapidOCR, then Tesseract, then none), "rapidocr", "tesseract" or "none".

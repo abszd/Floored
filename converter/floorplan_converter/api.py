@@ -31,6 +31,11 @@ def convert(image, options: ConverterOptions = None, **kwargs) -> ConversionResu
     opts = options or ConverterOptions()
     if kwargs:
         opts = ConverterOptions.from_kwargs(**{**asdict(opts), **kwargs})
+    img = load_image(image, opts.pdf_page, opts.pdf_dpi)
+    return _convert(img, opts, opts.auto_crop)
+
+
+def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool) -> ConversionResult:
     timings = {}
     t_start = t = time.perf_counter()
 
@@ -40,11 +45,25 @@ def convert(image, options: ConverterOptions = None, **kwargs) -> ConversionResu
         timings[name] = round(now - t, 3)
         t = now
 
-    img = load_image(image, opts.pdf_page, opts.pdf_dpi)
     wk = make_working(img, opts.max_working_size, opts.min_working_size)
     bgr = wk.bgr
     sty = style.analyze(bgr)
     lap("load_and_style")
+
+    box = None
+    if crop_ok:
+        box = _crop_box(walls.plan_bbox(sty.ink), wk.scale, img.shape, opts)
+        lap("find_plan")
+    if box is not None:
+        # The plan fills only part of the sheet: run again on the plan alone, which
+        # gets more working resolution for its thin lines.
+        x0, y0, x1, y1 = box
+        res = _convert(img[y0:y1, x0:x1], opts, False)
+        res = _translate(res, x0, y0, img.shape)
+        res.meta["crop"] = [x0, y0, x1, y1]
+        res.meta["timings_s"] = {**timings, **res.meta["timings_s"],
+                                 "total": round(time.perf_counter() - t_start, 3)}
+        return res
 
     backend = text.get_backend(opts.ocr)
     ocr_img = (255 - bgr) if sty.inverted else bgr
@@ -263,6 +282,54 @@ def convert(image, options: ConverterOptions = None, **kwargs) -> ConversionResu
         timings["debug"] = round(time.perf_counter() - t, 3)
     timings["total"] = round(time.perf_counter() - t_start, 3)
     return result
+
+
+def _crop_box(bbox, scale: float, shape, opts: ConverterOptions):
+    """Crop (original pixels) around the plan when the sheet around it is mostly empty
+    and the crop would be worked at a usefully higher resolution, else None."""
+    h, w = shape[:2]
+    x0, y0, x1, y1 = (v / scale for v in bbox)
+    side = max(x1 - x0, y1 - y0)
+    if side <= 0:
+        return None
+    m = 0.06 * side + 8
+    x0, y0 = max(0, int(x0 - m)), max(0, int(y0 - m))
+    x1, y1 = min(w, int(np.ceil(x1 + m))), min(h, int(np.ceil(y1 + m)))
+    longest = max(x1 - x0, y1 - y0)
+    if longest >= 0.8 * max(h, w):
+        return None
+    if longest > opts.max_working_size:
+        new_scale = opts.max_working_size / longest
+    elif longest < opts.min_working_size:
+        new_scale = min(opts.min_working_size / longest, 3.0)
+    else:
+        new_scale = 1.0
+    if new_scale < 1.4 * scale:
+        return None
+    return x0, y0, x1, y1
+
+
+def _translate(res: ConversionResult, dx: float, dy: float, shape) -> ConversionResult:
+    """Shift every coordinate of a result computed on a crop back to the full image."""
+    d = np.array([dx, dy], np.float64)
+
+    def ring(pts):
+        return _pts(np.asarray(pts, np.float64).reshape(-1, 2) + d) if pts else pts
+
+    for r in res.rooms:
+        r.polygon = ring(r.polygon)
+        r.holes = [ring(hh) for hh in r.holes]
+        r.centroid = ring([r.centroid])[0]
+    res.footprint = [{"polygon": ring(f["polygon"]), "holes": [ring(hh) for hh in f["holes"]]} for f in res.footprint]
+    res.outline = ring(res.outline) if res.outline else res.outline
+    for x in res.walls:
+        x.polyline = ring(x.polyline)
+    for x in res.doors:
+        x.polyline = ring(x.polyline)
+    for x in res.texts:
+        x.quad = ring(x.quad)
+    res.image_size = [int(shape[1]), int(shape[0])]
+    return res
 
 
 def _pts(a):
