@@ -244,7 +244,7 @@ class FloorPatch(BaseModel):
 
 class RoomPatch(BaseModel):
     label: str | None = None
-    kind: Literal["room", "corridor", "stair", "elevator", "restroom", "unknown"] | None = None
+    kind: Literal["room", "corridor", "stair", "elevator", "restroom", "outdoor", "unknown"] | None = None
 
 
 class PlacementIn(BaseModel):

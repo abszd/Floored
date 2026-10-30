@@ -13,7 +13,7 @@ from typing import Any, Protocol
 Point = list[float]
 Ring = list[Point]
 
-ROOM_KINDS = ("room", "corridor", "stair", "elevator", "restroom", "unknown")
+ROOM_KINDS = ("room", "corridor", "stair", "elevator", "restroom", "outdoor", "unknown")
 
 
 @dataclass
