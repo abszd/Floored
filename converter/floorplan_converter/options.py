@@ -29,6 +29,9 @@ class ConverterOptions:
     #: "auto" (RapidOCR, then Tesseract, then none), "rapidocr", "tesseract" or "none".
     #: Without OCR, text is still removed using shape analysis, but rooms get no labels.
     ocr: str = "auto"
+    #: Read which floor the plan shows from its text (title, floor number, room
+    #: numbers) into ``meta["floor"]``.
+    read_floor: bool = True
 
     # --- rooms -------------------------------------------------------------
     #: "interior" gives each room's floor area inside its walls (rooms separated by
