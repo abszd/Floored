@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.orm import object_session
 
 from ..models import Building, Candidate, Draft, Floor, Job, Source
+from ..pipeline import sheet_regions
 from ..placement.transform import Placement
 
 
@@ -27,6 +28,9 @@ def floor_summary(f: Floor) -> dict[str, Any]:
         "room_count": len((f.conversion or {}).get("rooms") or []),
         "image_url": media_url(f.image_path),
         "source_url": f.source_url,
+        # The converter thinks this sheet holds several floors but wasn't sure enough to split it.
+        "sheet_count": len(sheet_regions(f.conversion or {})),
+        "undo": (f.history or [])[-1]["label"] if f.history else None,
         "updated_at": f.updated_at,
     }
 
@@ -46,6 +50,12 @@ def floor_detail(f: Floor) -> dict[str, Any]:
                 else None
             ),
             "debug_images": {k: media_url(v) for k, v in debug.items()},
+            "sheets": sheet_regions(conv),
+            # The converter's outline and rooms in image pixels, drawn over the plan when cropping.
+            "outline_px": conv.get("outline"),
+            "rooms_px": [
+                [[round(x), round(y)] for x, y in r["polygon"]] for r in conv.get("rooms") or [] if len(r.get("polygon") or []) >= 3
+            ],
             "geojson": f.geojson,
         }
     )

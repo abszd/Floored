@@ -61,6 +61,10 @@ interface Props {
   selectedBuildingId: string | null;
   /** Rooms highlighted as selected (several when shift-clicking to merge). */
   selectedRoomUids: string[];
+  /** Walls and doors picked with an area selection. */
+  selectedWallUids?: string[];
+  /** The area-select tool: a plain drag draws the box (normally it takes shift). */
+  areaSelect?: boolean;
   basemap: Basemap;
   threeD: boolean;
   hideRooms?: boolean;
@@ -68,8 +72,8 @@ interface Props {
   onSelectBuilding: (id: string | null) => void;
   /** ``additive``: shift was held, so add to (or take from) the selection instead of replacing it. */
   onSelectRoom: (click: RoomClick | null, additive?: boolean) => void;
-  /** Rooms inside a shift-dragged box. */
-  onSelectRooms?: (clicks: RoomClick[]) => void;
+  /** Rooms, and the uids of walls and doors, inside a dragged box. */
+  onSelectRooms?: (clicks: RoomClick[], walls: string[]) => void;
   onHover?: (h: Hover | null) => void;
   onPick?: (lngLat: [number, number]) => void;
   onReady?: (map: MBMap) => void;
@@ -151,6 +155,10 @@ export default function MapView(props: Props) {
 
     map.on("click", (e) => {
       const p = latest.current;
+      if (swallowClick) {
+        swallowClick = false;
+        return;
+      }
       if (p.picking) {
         p.onPick?.([e.lngLat.lng, e.lngLat.lat]);
         return;
@@ -173,6 +181,8 @@ export default function MapView(props: Props) {
     map.boxZoom.disable();
     const canvas = map.getCanvasContainer();
     let boxStart: mapboxgl.Point | null = null;
+    // The click that ends a box drag isn't a click on a room.
+    let swallowClick = false;
     let boxEl: HTMLDivElement | null = null;
     const pos = (e: MouseEvent) => {
       const r = canvas.getBoundingClientRect();
@@ -203,25 +213,43 @@ export default function MapView(props: Props) {
       if (boxEl) {
         boxEl.remove();
         boxEl = null;
+        swallowClick = true;
+        setTimeout(() => (swallowClick = false), 0);
       } else return; // no drag: the click handler deals with it
       const end = pos(e);
       if (!start || Math.abs(end.x - start.x) < 4 || Math.abs(end.y - start.y) < 4) return;
-      const layers = ["rooms-fill", "rooms-3d"].filter((l) => map.getLayer(l));
+      const layers = ["rooms-fill", "rooms-3d", "rooms-walls", "rooms-doors"].filter((l) => map.getLayer(l));
       const hits = layers.length ? map.queryRenderedFeatures([start, end], { layers }) : [];
+      // Only what lies mostly inside the box: its middle has to be in it, so a long corridor
+      // the box merely touches isn't picked up.
+      const [x0, x1] = [Math.min(start.x, end.x), Math.max(start.x, end.x)];
+      const [y0, y1] = [Math.min(start.y, end.y), Math.max(start.y, end.y)];
+      const inside = (g: Geometry) => {
+        const b = new mapboxgl.LngLatBounds();
+        eachCoord(g, (c) => b.extend(c as [number, number]));
+        if (b.isEmpty()) return false;
+        const p = map.project(b.getCenter());
+        return p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1;
+      };
       const seen = new Set<string>();
-      const clicks = hits
-        .filter((h) => {
-          const id = String(h.id);
-          if (seen.has(id)) return false;
-          seen.add(id);
-          return true;
-        })
-        .map((h) => ({ feature: h as unknown as RoomClick["feature"], lngLat: map.unproject(end).toArray() as [number, number] }));
-      if (clicks.length) latest.current.onSelectRooms?.(clicks);
+      const clicks: RoomClick[] = [];
+      const walls: string[] = [];
+      for (const h of hits) {
+        const id = String(h.id);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        // Rendered features are clipped to tiles; use the full shape from the source data.
+        const full = latest.current.rooms?.features.find((f) => String(f.id) === id) ?? h;
+        if (!inside(full.geometry)) continue;
+        const kind = h.properties?.feature;
+        if (kind === "room") clicks.push({ feature: h as unknown as RoomClick["feature"], lngLat: map.unproject(end).toArray() as [number, number] });
+        else if (kind === "wall" || kind === "door") walls.push(id);
+      }
+      if (clicks.length || walls.length) latest.current.onSelectRooms?.(clicks, walls);
     };
     canvas.addEventListener("mousedown", (e: MouseEvent) => {
       const p = latest.current;
-      if (!e.shiftKey || e.button !== 0 || p.picking || p.hideRooms) return;
+      if ((!e.shiftKey && !p.areaSelect) || e.button !== 0 || p.picking || p.hideRooms) return;
       map.dragPan.disable();
       boxStart = pos(e);
       document.addEventListener("mousemove", onBoxMove);
@@ -312,12 +340,32 @@ export default function MapView(props: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [styleReady, selectedKey, props.rooms]);
 
+  const prevWalls = useRef<string[]>([]);
+  const wallKey = (props.selectedWallUids ?? []).join("|");
   useEffect(() => {
     const map = mapRef.current;
-    if (map) map.getCanvas().style.cursor = props.picking ? "crosshair" : "";
-  }, [props.picking]);
+    if (!map || !styleReady || !map.getSource("rooms")) return;
+    for (const id of prevWalls.current) map.setFeatureState({ source: "rooms", id }, { selected: false });
+    for (const id of props.selectedWallUids ?? []) map.setFeatureState({ source: "rooms", id }, { selected: true });
+    prevWalls.current = props.selectedWallUids ?? [];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [styleReady, wallKey, props.rooms]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map) map.getCanvas().style.cursor = props.picking || props.areaSelect ? "crosshair" : "";
+  }, [props.picking, props.areaSelect]);
 
   return <div ref={container} className="absolute inset-0" />;
+}
+
+function eachCoord(g: Geometry, fn: (c: number[]) => void) {
+  if (g.type === "GeometryCollection") return g.geometries.forEach((x) => eachCoord(x, fn));
+  const walk = (a: unknown): void => {
+    if (Array.isArray(a) && typeof a[0] === "number") fn(a as number[]);
+    else if (Array.isArray(a)) a.forEach(walk);
+  };
+  walk(g.coordinates);
 }
 
 function addLayers(map: MBMap, fallback: boolean) {
@@ -417,7 +465,11 @@ function addLayers(map: MBMap, fallback: boolean) {
     source: "rooms",
     ...slot("middle"),
     filter: ["==", ["get", "feature"], "wall"],
-    paint: { "line-color": "#1e293b", "line-width": 1.5, "line-emissive-strength": 1 },
+    paint: {
+      "line-color": ["case", selected, "#e11d48", "#1e293b"] as never,
+      "line-width": ["case", selected, 4, 1.5] as never,
+      "line-emissive-strength": 1,
+    },
   });
   map.addLayer({
     id: "rooms-doors",
@@ -425,7 +477,11 @@ function addLayers(map: MBMap, fallback: boolean) {
     source: "rooms",
     ...slot("middle"),
     filter: ["==", ["get", "feature"], "door"],
-    paint: { "line-color": "#f8fafc", "line-width": 2, "line-emissive-strength": 1 },
+    paint: {
+      "line-color": ["case", selected, "#e11d48", "#f8fafc"] as never,
+      "line-width": ["case", selected, 4, 2] as never,
+      "line-emissive-strength": 1,
+    },
   });
 
   // ---- 3D: a glass shell for the building, faint slabs for other floors, the viewed floor in colour.

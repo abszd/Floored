@@ -234,3 +234,52 @@ function RoomRowView({
     </tr>
   );
 }
+
+/** Copy a plan, rooms and placement included, to another level: towers often repeat the same floor. */
+export function DuplicateFloorDialog({ floor, onClose }: { floor: FloorSummary; onClose: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [level, setLevel] = useState(String(floor.level + 1));
+  const [name, setName] = useState("");
+  const copy = useMutation({
+    mutationFn: () => api.duplicateFloor(floor.id, { level: Number(level), name: name.trim() || undefined }),
+    onSuccess: (f) => {
+      qc.invalidateQueries();
+      toast.success(`Copied to ${f.name}`, f.level_note ?? undefined);
+      onClose();
+    },
+    onError: (e: Error) => toast.error("Couldn't copy", e.message),
+  });
+  const bad = level.trim() === "" || Number.isNaN(Number(level));
+  return (
+    <Modal title={`Copy ${floor.name} to another level`} onClose={onClose}>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!bad) copy.mutate();
+        }}
+      >
+        <p className="text-sm text-slate-500">The copy keeps the rooms, their numbers and the placement. Change the room numbers on it afterwards.</p>
+        <div className="flex gap-2">
+          <div>
+            <label className="label">Level</label>
+            <input autoFocus className="input w-24" value={level} onChange={(e) => setLevel(e.target.value)} />
+          </div>
+          <div className="flex-1">
+            <label className="label">Name</label>
+            <input className="input" placeholder="e.g. 3rd floor" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" className="btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn-primary" disabled={bad || copy.isPending}>
+            {copy.isPending && <Spinner />} Copy
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}

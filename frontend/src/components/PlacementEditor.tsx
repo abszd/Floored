@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl, { type ImageSource, type Map as MBMap } from "mapbox-gl";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { FlipHorizontal2, Magnet, RotateCw, Save, Undo2, X, Copy, Lock, Unlock } from "lucide-react";
+import { Compass, FlipHorizontal2, Keyboard, Layers, Magnet, Redo2, RotateCcw, RotateCw, Save, Undo2, X, Copy, Lock, Unlock } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import * as P from "../lib/placement";
 import type { Building, Floor, Placement } from "../lib/types";
@@ -13,6 +13,31 @@ interface Props {
   floor: Floor;
   building: Building;
   onClose: () => void;
+}
+
+/** Rotation that lines the plan up with the nearest long edge of the building outline. */
+function alignToEdge(p: Placement, footprint: Building["footprint"]): number | null {
+  if (!footprint) return null;
+  const rings: number[][][] =
+    footprint.type === "Polygon" ? footprint.coordinates : footprint.type === "MultiPolygon" ? footprint.coordinates.flat() : [];
+  const edges: { bearing: number; len: number }[] = [];
+  for (const ring of rings) {
+    for (let i = 0; i + 1 < ring.length; i++) {
+      const [e0, n0] = P.toLocal(p, ring[i][0], ring[i][1]);
+      const [e1, n1] = P.toLocal(p, ring[i + 1][0], ring[i + 1][1]);
+      const len = Math.hypot(e1 - e0, n1 - n0);
+      if (len > 0.5) edges.push({ bearing: (Math.atan2(e1 - e0, n1 - n0) * 180) / Math.PI, len });
+    }
+  }
+  if (!edges.length) return null;
+  const longest = Math.max(...edges.map((e) => e.len));
+  // Of the longer edges, the one needing the smallest turn (plans are drawn square to the walls).
+  let best: number | null = null;
+  for (const e of edges.filter((e) => e.len >= 0.25 * longest)) {
+    const d = ((((e.bearing - p.rotation_deg) % 90) + 135) % 90) - 45;
+    if (best === null || Math.abs(d) < Math.abs(best)) best = d;
+  }
+  return best === null ? null : (((p.rotation_deg + best) % 360) + 360) % 360;
 }
 
 function initialPlacement(floor: Floor, building: Building): Placement {
@@ -48,6 +73,94 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
   const uniformRef = useRef(uniform);
   uniformRef.current = uniform;
   const markers = useRef<{ move: mapboxgl.Marker; rotate: mapboxgl.Marker; corners: mapboxgl.Marker[] } | null>(null);
+  const [allFloors, setAllFloors] = useState(false);
+  const [showKeys, setShowKeys] = useState(false);
+
+  // Undo and redo within the editor: a change is recorded once it has settled for a moment
+  // (so a drag is one step, not hundreds).
+  const past = useRef<Placement[]>([placement]);
+  const future = useRef<Placement[]>([]);
+  const travelling = useRef(false);
+  const [, bump] = useState(0);
+  useEffect(() => {
+    if (travelling.current) {
+      travelling.current = false;
+      return;
+    }
+    const t = setTimeout(() => {
+      const last = past.current[past.current.length - 1];
+      if (JSON.stringify(last) === JSON.stringify(placement)) return;
+      past.current = [...past.current, placement].slice(-100);
+      future.current = [];
+      bump((n) => n + 1);
+    }, 350);
+    return () => clearTimeout(t);
+  }, [placement]);
+  const stepBack = () => {
+    // A change still settling counts as the latest step.
+    const last = past.current[past.current.length - 1];
+    if (JSON.stringify(last) !== JSON.stringify(pRef.current)) past.current = [...past.current, pRef.current];
+    if (past.current.length < 2) return;
+    future.current = [past.current[past.current.length - 1], ...future.current];
+    past.current = past.current.slice(0, -1);
+    travelling.current = true;
+    setPlacement(past.current[past.current.length - 1]);
+    bump((n) => n + 1);
+  };
+  const stepForward = () => {
+    if (!future.current.length) return;
+    const [next, ...rest] = future.current;
+    future.current = rest;
+    past.current = [...past.current, next];
+    travelling.current = true;
+    setPlacement(next);
+    bump((n) => n + 1);
+  };
+
+  // Keyboard: arrows move, Q/E or , . turn, + and - resize; shift for bigger steps.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement)?.closest("input, textarea, select")) return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        return e.shiftKey ? stepForward() : stepBack();
+      }
+      if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        return stepForward();
+      }
+      if (mod && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        return save.mutate();
+      }
+      if (mod || e.altKey) return;
+      const big = e.shiftKey;
+      const p = pRef.current;
+      const step = big ? 2 : 0.25; // metres
+      const move = (de: number, dn: number) => {
+        const [lon, lat] = P.toLonLat(p, de, dn);
+        setPlacement(P.withCenter(p, lon, lat));
+      };
+      const turn = (d: number) => setPlacement({ ...p, rotation_deg: (((p.rotation_deg + d) % 360) + 360) % 360 });
+      const k = e.key;
+      if (k === "ArrowUp") move(0, step);
+      else if (k === "ArrowDown") move(0, -step);
+      else if (k === "ArrowLeft") move(-step, 0);
+      else if (k === "ArrowRight") move(step, 0);
+      else if (k === "q" || k === "Q" || k === ",") turn(big ? -5 : -0.5);
+      else if (k === "e" || k === "E" || k === ".") turn(big ? 5 : 0.5);
+      else if (k === "+" || k === "=") setPlacement(P.scaled(p, big ? 1.05 : 1.01));
+      else if (k === "-" || k === "_") setPlacement(P.scaled(p, big ? 1 / 1.05 : 1 / 1.01));
+      else if (k === "a" || k === "A") {
+        const r = alignToEdge(p, building.footprint);
+        if (r !== null) setPlacement({ ...p, rotation_deg: Math.round(r * 10) / 10 });
+      } else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   // Image overlay + footprint highlight + handles.
   useEffect(() => {
@@ -135,10 +248,13 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
   }, [map, floor.id]);
 
   const save = useMutation({
-    mutationFn: () => api.savePlacement(floor.id, pRef.current),
-    onSuccess: () => {
+    mutationFn: async () => {
+      await api.savePlacement(floor.id, pRef.current);
+      return allFloors ? (await api.lineUpAll(floor.id)).moved : 0;
+    },
+    onSuccess: (moved) => {
       qc.invalidateQueries();
-      toast.success("Placement saved");
+      toast.success("Placement saved", moved ? `${moved} other floor${moved > 1 ? "s" : ""} lined up with it.` : undefined);
       onClose();
     },
     onError: (e: Error) => toast.error("Couldn't save placement", e.message),
@@ -201,6 +317,17 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
           </button>
           <button className="btn-secondary" onClick={() => setPlacement((p) => ({ ...p, mirror: !p.mirror }))}>
             <FlipHorizontal2 className="h-4 w-4" /> Mirror
+          </button>
+          <button
+            className="btn-secondary col-span-2"
+            disabled={!building.footprint}
+            title="Turn the plan the smallest amount that makes it square to the building's walls (A)"
+            onClick={() => {
+              const r = alignToEdge(pRef.current, building.footprint);
+              if (r !== null) setPlacement((p) => ({ ...p, rotation_deg: Math.round(r * 10) / 10 }));
+            }}
+          >
+            <Compass className="h-4 w-4" /> Square up with the building
           </button>
         </div>
         {!building.footprint && (
@@ -265,6 +392,28 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
           <input type="range" min={0.1} max={1} step={0.05} value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} className="w-full accent-indigo-600" />
         </div>
 
+        <div>
+          <button className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700" onClick={() => setShowKeys((v) => !v)}>
+            <Keyboard className="h-3.5 w-3.5" /> Keyboard shortcuts
+          </button>
+          {showKeys && (
+            <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-slate-600">
+              <dt className="font-mono">← ↑ → ↓</dt>
+              <dd>Move 25 cm (shift: 2 m)</dd>
+              <dt className="font-mono">Q / E</dt>
+              <dd>Turn 0.5° (shift: 5°)</dd>
+              <dt className="font-mono">+ / −</dt>
+              <dd>Grow or shrink 1% (shift: 5%)</dd>
+              <dt className="font-mono">A</dt>
+              <dd>Square up with the building</dd>
+              <dt className="font-mono">Ctrl+Z / Ctrl+Y</dt>
+              <dd>Undo / redo</dd>
+              <dt className="font-mono">Ctrl+S</dt>
+              <dd>Save</dd>
+            </dl>
+          )}
+        </div>
+
         {others.length > 0 && (
           <div>
             <label className="label">Line up with another floor</label>
@@ -279,9 +428,21 @@ export default function PlacementEditor({ map, floor, building, onClose }: Props
         )}
       </div>
 
+      {building.floors.length > 1 && (
+        <label className="flex items-center gap-2 border-t border-slate-100 px-4 pt-3 text-sm">
+          <input type="checkbox" className="accent-indigo-600" checked={allFloors} onChange={(e) => setAllFloors(e.target.checked)} />
+          <Layers className="h-3.5 w-3.5 text-slate-400" /> Use this placement for every floor
+        </label>
+      )}
       <div className="flex gap-2 border-t border-slate-100 p-4">
-        <button className="btn-secondary" onClick={() => setPlacement(initialPlacement(floor, building))}>
-          <Undo2 className="h-4 w-4" /> Reset
+        <button className="btn-secondary px-2.5" onClick={stepBack} disabled={past.current.length < 2 && JSON.stringify(past.current[0]) === JSON.stringify(placement)} title="Undo (Ctrl+Z)">
+          <Undo2 className="h-4 w-4" />
+        </button>
+        <button className="btn-secondary px-2.5" onClick={stepForward} disabled={!future.current.length} title="Redo (Ctrl+Y)">
+          <Redo2 className="h-4 w-4" />
+        </button>
+        <button className="btn-ghost px-2.5" onClick={() => setPlacement(initialPlacement(floor, building))} title="Back to the saved placement">
+          <RotateCcw className="h-4 w-4" />
         </button>
         <div className="flex-1" />
         <button className="btn-ghost" onClick={onClose}>

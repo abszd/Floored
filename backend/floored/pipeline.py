@@ -187,8 +187,14 @@ def merge_rooms(floor: Floor, room_ids: list[str], *, label: str | None = None, 
     return ids[0]
 
 
-def process_floor(floor_id: str, converter: str | None = None, keep_placement: bool = False) -> dict[str, Any]:
-    """Run the converter on a floor's image and place the result."""
+def process_floor(
+    floor_id: str, converter: str | None = None, keep_placement: bool = False, *, split: bool = True
+) -> dict[str, Any]:
+    """Run the converter on a floor's image and place the result.
+
+    A sheet the converter is sure holds several floors is cut into one floor
+    each, unless ``split`` is off (the image is already one part of a sheet).
+    """
     with session_scope() as s:
         floor = s.get(Floor, floor_id)
         if floor is None:
@@ -213,17 +219,30 @@ def process_floor(floor_id: str, converter: str | None = None, keep_placement: b
     data["meta"] = {**data.get("meta", {}), "debug_images": debug}
     with session_scope() as s:
         floor = s.get(Floor, floor_id)
+        if (floor.conversion or {}).get("rooms"):
+            snapshot(floor, "Convert again")
         floor.conversion = data
         floor.converter = conv_impl.name
         floor.image_width, floor.image_height = conv.image_size
-        _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
         if keep_placement and floor.placement:
+            _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             floor.status = "placed"
             refresh_geojson(floor)
-            fit = None
-        else:
+            return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": None, "status": floor.status}
+        parts = auto_split(s, floor) if split else []
+        if not parts:
+            _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             fit = autoplace(floor, floor.building)
-        return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": fit, "status": floor.status}
+            return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": fit, "status": floor.status}
+        # Parts of the sheet the converter found no rooms in are converted on their own.
+        empty = [(f.id, f"Converting {f.building.name} · {f.name}") for f in parts if not (f.conversion or {}).get("rooms")]
+        for f in parts:
+            if f.id in dict(empty):
+                f.status = "pending"
+        out = {"floor_id": floor_id, "rooms": len(conv.rooms), "split_into": [f.id for f in parts], "status": floor.status}
+    for fid, label in empty:
+        jobs.submit("process_floor", {"floor_id": fid, "split": False}, label=label)
+    return out
 
 
 def free_level(taken: set[float], wanted: float | None) -> float:
@@ -527,6 +546,170 @@ def spread_levels(b: Building) -> int:
     return moved
 
 
+# ---------------------------------------------------------------- editing
+
+HISTORY_LIMIT = 12
+_SNAP_FIELDS = ("conversion", "placement", "status", "fit_score", "image_path", "image_width", "image_height", "level", "name", "level_note")
+
+
+def snapshot(floor: Floor, label: str, *, created: list[str] | None = None) -> None:
+    """Remember the floor as it is now, so the next change can be undone."""
+    snap: dict[str, Any] = {k: getattr(floor, k) for k in _SNAP_FIELDS}
+    if snap["status"] in ("processing", "pending"):
+        snap["status"] = "needs_review" if floor.placement else "pending"
+    snap["label"] = label
+    snap["at"] = datetime.now(timezone.utc).isoformat()
+    snap["created"] = list(created or [])
+    floor.history = [*(floor.history or []), snap][-HISTORY_LIMIT:]
+
+
+def undo(s: Session, floor: Floor) -> str:
+    """Put the floor back as it was before its last change. Returns what was undone."""
+    hist = list(floor.history or [])
+    if not hist:
+        raise ValueError("nothing to undo")
+    snap = hist.pop()
+    for fid in snap.get("created") or []:
+        other = s.get(Floor, fid)
+        if other is not None and other.building_id == floor.building_id:
+            s.delete(other)
+    s.flush()
+    for k in _SNAP_FIELDS:
+        if k in snap:
+            setattr(floor, k, snap[k])
+    floor.history = hist
+    refresh_geojson(floor)
+    return snap.get("label") or "last change"
+
+
+def line_up(floor: Floor, other: Floor) -> None:
+    """Put ``floor`` where ``other`` is, at the same metres per pixel."""
+    p = Placement.from_dict(other.placement)
+    if floor.image_width and other.image_width and (floor.image_width, floor.image_height) != (other.image_width, other.image_height):
+        # Same scale in metres per pixel, so different-sized exports still line up.
+        p.width_m = p.width_m * floor.image_width / other.image_width
+        p.height_m = p.height_m * floor.image_height / other.image_height
+    floor.placement = p.to_dict()
+    floor.status = "placed"
+    refresh_geojson(floor)
+
+
+def split_floor(
+    s: Session,
+    floor: Floor,
+    regions: list[dict[str, Any]],
+    *,
+    refit: bool = True,
+    label: str | None = None,
+) -> list[Floor]:
+    """Cut a plan image into one floor per region (one region is a crop).
+
+    Each region is ``{"bbox": [x0, y0, x1, y1] in image pixels, "level"?, "name"?, "outline"?}``.
+    The first region stays this floor; the rest become new floors of the same
+    building on their own levels. Rooms keep their numbers and types. With
+    ``refit`` each piece is fitted to the building outline again; otherwise it
+    stays where it was on the map (new floors stack on the first).
+    """
+    from . import editing
+
+    if not regions:
+        raise ValueError("draw at least one area")
+    if floor.conversion is None or not floor.image_path:
+        raise ValueError("the plan hasn't been converted yet")
+    conv = floor.conversion
+    w, h = conv.get("image_size") or [floor.image_width, floor.image_height]
+    boxes = [editing.clamp_box(r["bbox"], w, h) for r in regions]
+    image = storage.read_bytes(floor.image_path)
+    old_place = Placement.from_dict(floor.placement) if floor.placement else None
+    b = floor.building
+    snap_label = label or ("Crop" if len(regions) == 1 else f"Split into {len(regions)} floors")
+    before: dict[str, Any] = {k: getattr(floor, k) for k in _SNAP_FIELDS}
+    taken = {f.level for f in b.floors if f.id != floor.id}
+
+    out: list[Floor] = []
+    anchor: Placement | None = None
+    for i, (r, bx) in enumerate(zip(regions, boxes)):
+        sub = editing.crop_conversion(conv, bx)
+        ring = r.get("outline")
+        if ring and len(ring) >= 3:
+            sub["outline"] = [[float(x) - bx[0], float(y) - bx[1]] for x, y in ring]
+        wanted = r.get("level")
+        if i == 0:
+            target = floor
+            lvl = floor.level if wanted is None else free_level(taken, float(wanted))
+        else:
+            lvl = free_level(taken, None if wanted is None else float(wanted))
+            target = Floor(building=b, level=lvl, name=level_name(lvl), converter=floor.converter)
+            target.source_url = f"{floor.source_url}#part={i + 1}" if floor.source_url else None
+            s.add(target)
+        taken.add(lvl)
+        if wanted is None and i > 0:
+            target.level_note = "Cut from a sheet with several floors; check which floor this is."
+        elif wanted is not None and lvl != float(wanted):
+            target.level_note = f"Labelled {level_name(float(wanted)).lower()}, which another plan has; check which floor this is."
+        elif wanted is not None:
+            target.level_note = None
+        target.name = r.get("name") or (target.name if i == 0 and lvl == floor.level else level_name(lvl))
+        target.level = lvl
+        target.image_path = storage.save_bytes(editing.crop_image(image, bx), "plans", ".png")
+        target.image_width, target.image_height = bx[2] - bx[0], bx[3] - bx[1]
+        target.conversion = sub
+        target.error = None
+        s.flush()
+
+        cropped = editing.crop_placement(old_place, bx, w, h) if old_place else None
+        if i == 0:
+            anchor = cropped
+        if refit and b.footprint:
+            autoplace(target, b)
+        elif cropped is not None and anchor is not None:
+            p = cropped if i == 0 else Placement(
+                anchor.center_lon, anchor.center_lat, cropped.width_m, cropped.height_m, anchor.rotation_deg, anchor.mirror
+            )
+            target.placement = p.to_dict()
+            target.status = floor.status if i == 0 and floor.status in ("placed", "needs_review") else "needs_review"
+            refresh_geojson(target)
+        else:
+            autoplace(target, b)
+        out.append(target)
+
+    created = [f.id for f in out[1:]]
+    before.update(label=snap_label, at=datetime.now(timezone.utc).isoformat(), created=created)
+    floor.history = [*(floor.history or []), before][-HISTORY_LIMIT:]
+    return out
+
+
+def sheet_regions(conv: dict[str, Any]) -> list[dict[str, Any]]:
+    """The converter's guess at separate floors on one sheet, as split regions."""
+    out = []
+    for sh in (conv.get("meta") or {}).get("sheets") or []:
+        if not sh.get("bbox") or len(sh["bbox"]) != 4:
+            continue
+        info = sh.get("floor") or {}
+        level = sh.get("level", info.get("level"))
+        level_ok = level is not None and info.get("confidence", 1.0 if sh.get("level") is not None else 0) >= 0.5
+        out.append(
+            {
+                "bbox": [float(v) for v in sh["bbox"]],
+                "level": float(level) if level_ok else None,
+                "name": (sh.get("label") or info.get("label")) if level_ok else None,
+                "outline": sh.get("outline"),
+                "confidence": float(sh.get("confidence") or 0),
+            }
+        )
+    return out if len(out) >= 2 else []
+
+
+def auto_split(s: Session, floor: Floor) -> list[Floor]:
+    """Split a sheet the converter is sure holds several floors. Unsure ones are left as a suggestion."""
+    regions = sheet_regions(floor.conversion or {})
+    if not regions or min(r["confidence"] for r in regions) < 0.5:
+        return []
+    if not floor.level_note:
+        regions[0] = {**regions[0], "level": None, "name": None}  # the level was given by the page; keep it
+    return split_floor(s, floor, regions, refit=True, label="Split the sheet into floors")
+
+
 def approve_candidate(candidate_id: str, building_id: str | None = None, level: float | None = None) -> str:
     """Turn a candidate into a floor and process it. Returns the floor id."""
     with session_scope() as s:
@@ -668,7 +851,9 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
 @jobs.handler("process_floor")
 def _process_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, Any]:
     progress(0.1, "Finding rooms")
-    return process_floor(payload["floor_id"], payload.get("converter"), payload.get("keep_placement", False))
+    return process_floor(
+        payload["floor_id"], payload.get("converter"), payload.get("keep_placement", False), split=payload.get("split", True)
+    )
 
 
 @jobs.handler("approve_candidate")

@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowLeft, ExternalLink, Image as ImageIcon, ListOrdered, Minus, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Shapes, Trash2, Layers } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Copy, Crop, ExternalLink, Image as ImageIcon, ListOrdered, Minus, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Scissors, Shapes, Trash2, Layers, Undo2 } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
 import type { Building, FloorSummary } from "../lib/types";
 import AddFloorDialog from "./AddFloorDialog";
 import EditBuildingDialog from "./EditBuildingDialog";
-import { EditFloorDialog, RoomsDialog } from "./FloorDialogs";
+import { DuplicateFloorDialog, EditFloorDialog, RoomsDialog } from "./FloorDialogs";
+import SplitFloorDialog from "./SplitFloorDialog";
 import { Empty, Modal, StatusBadge } from "./ui";
 import { useToast } from "./Toast";
 
@@ -152,6 +153,17 @@ function FloorRow({
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
   const [rooms, setRooms] = useState(false);
+  const [splitting, setSplitting] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const undo = useMutation({
+    mutationFn: () => api.undoFloor(floor.id),
+    onSuccess: ({ undone }) => {
+      qc.invalidateQueries();
+      toast.success(`Undid “${undone}”`);
+    },
+    onError: (e: Error) => toast.error("Couldn't undo", e.message),
+  });
+  const converted = floor.room_count > 0 || floor.status === "placed" || floor.status === "needs_review";
   const reprocess = useMutation({
     mutationFn: () => api.reprocess(floor.id),
     onSuccess: ({ job_id }) => track(job_id, `${floor.name} conversion`),
@@ -189,6 +201,18 @@ function FloorRow({
               Check level
             </button>
           )}
+          {floor.sheet_count > 1 && (
+            <button
+              className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700"
+              title="The converter thinks this sheet shows several floors. Check and split it."
+              onClick={(e) => {
+                e.stopPropagation();
+                setSplitting(true);
+              }}
+            >
+              <Scissors className="h-3 w-3" /> {floor.sheet_count} floors on one sheet?
+            </button>
+          )}
           {floor.room_count > 0 && <span className="text-xs text-slate-400">{floor.room_count} rooms</span>}
         </div>
         {floor.status === "error" && floor.error && <div className="mt-1 line-clamp-2 text-xs text-rose-600">{floor.error}</div>}
@@ -214,7 +238,7 @@ function FloorRow({
         <MoreHorizontal className="h-4 w-4" />
       </button>
       {menu && (
-        <div className="panel absolute right-2 top-11 z-10 w-48 p-1 text-sm" onMouseLeave={() => setMenu(false)} onClick={(e) => e.stopPropagation()}>
+        <div className="panel absolute right-2 top-11 z-10 w-56 p-1 text-sm" onMouseLeave={() => setMenu(false)} onClick={(e) => e.stopPropagation()}>
           <MenuItem icon={<Pencil className="h-4 w-4" />} onClick={() => (setMenu(false), setEditing(true))}>
             Rename or change level
           </MenuItem>
@@ -224,6 +248,17 @@ function FloorRow({
           <MenuItem icon={<Move className="h-4 w-4" />} disabled={busy || floor.status === "error"} onClick={() => (setMenu(false), onEdit())}>
             Adjust placement
           </MenuItem>
+          <MenuItem icon={<Crop className="h-4 w-4" />} disabled={busy || !converted} onClick={() => (setMenu(false), setSplitting(true))}>
+            Crop or split plan
+          </MenuItem>
+          <MenuItem icon={<Copy className="h-4 w-4" />} disabled={busy || !converted} onClick={() => (setMenu(false), setCopying(true))}>
+            Copy to another level
+          </MenuItem>
+          {floor.undo && (
+            <MenuItem icon={<Undo2 className="h-4 w-4" />} disabled={busy || undo.isPending} onClick={() => (setMenu(false), undo.mutate())}>
+              <span className="truncate">Undo {floor.undo.toLowerCase()}</span>
+            </MenuItem>
+          )}
           <MenuItem icon={<ImageIcon className="h-4 w-4" />} onClick={() => (setMenu(false), onPreview())}>
             View plan images
           </MenuItem>
@@ -248,6 +283,16 @@ function FloorRow({
       {rooms && (
         <div onClick={(e) => e.stopPropagation()}>
           <RoomsDialog floor={floor} onClose={() => setRooms(false)} />
+        </div>
+      )}
+      {splitting && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <SplitFloorDialog floorId={floor.id} onClose={() => setSplitting(false)} />
+        </div>
+      )}
+      {copying && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <DuplicateFloorDialog floor={floor} onClose={() => setCopying(false)} />
         </div>
       )}
     </div>

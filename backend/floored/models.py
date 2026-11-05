@@ -71,6 +71,8 @@ class Floor(Base):
     fit_score: Mapped[float | None] = mapped_column(Float)
     # Rooms in lon/lat, regenerated whenever conversion or placement changes.
     geojson: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    # Earlier versions of the plan for undo, newest last (see pipeline.snapshot).
+    history: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 

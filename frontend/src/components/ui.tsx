@@ -13,7 +13,8 @@ export function Modal({
   title: string;
   onClose: () => void;
   children: ReactNode;
-  wide?: boolean;
+  /** true for a wide dialog, "xl" for one that needs most of the screen. */
+  wide?: boolean | "xl";
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -24,7 +25,7 @@ export function Modal({
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4 backdrop-blur-sm" onMouseDown={onClose}>
       <div
-        className={clsx("panel max-h-[90vh] w-full overflow-auto", wide ? "max-w-3xl" : "max-w-lg")}
+        className={clsx("panel max-h-[90vh] w-full overflow-auto", wide === "xl" ? "max-w-6xl" : wide ? "max-w-3xl" : "max-w-lg")}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">

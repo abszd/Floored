@@ -1,5 +1,6 @@
 import { NavLink, Route, Routes } from "react-router-dom";
-import { Map as MapIcon, Radar } from "lucide-react";
+import { Map as MapIcon, Monitor, Moon, Radar, Sun } from "lucide-react";
+import { useTheme } from "./lib/theme";
 import MapPage from "./pages/MapPage";
 import DiscoverPage from "./pages/DiscoverPage";
 import ActivityPanel, { ActivityButton } from "./components/ActivityPanel";
@@ -22,6 +23,18 @@ function BackendBanner() {
 const nav = ({ isActive }: { isActive: boolean }) =>
   `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition ${isActive ? "bg-slate-100 text-slate-900" : "text-slate-500 hover:text-slate-800"}`;
 
+function ThemeButton() {
+  const [theme, setTheme] = useTheme();
+  const next = { system: "light", light: "dark", dark: "system" } as const;
+  const Icon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
+  const label = { system: "Theme: follows your computer", light: "Theme: light", dark: "Theme: dark" }[theme];
+  return (
+    <button className="btn-ghost p-2" onClick={() => setTheme(next[theme])} title={`${label}. Click to change.`} aria-label={label} data-testid="theme">
+      <Icon className="h-4 w-4" />
+    </button>
+  );
+}
+
 export default function App() {
   return (
     <div className="flex h-full flex-col">
@@ -39,6 +52,7 @@ export default function App() {
           </NavLink>
         </nav>
         <div className="flex-1" />
+        <ThemeButton />
         <ActivityButton />
       </header>
       <ActivityPanel />

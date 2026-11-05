@@ -7,6 +7,7 @@ import { Building2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Plus, Rad
 import clsx from "clsx";
 import { api } from "../lib/api";
 import { levelShort } from "../lib/placement";
+import { isDark } from "../lib/theme";
 import type { Building } from "../lib/types";
 import MapView, { FLOOR_HEIGHT_M, type Basemap, type Hover, type RoomClick } from "../components/MapView";
 import { HoverTip, MapControls, TokenNotice } from "../components/MapChrome";
@@ -14,6 +15,8 @@ import BuildingPanel from "../components/BuildingPanel";
 import PlacementEditor from "../components/PlacementEditor";
 import RoomCard, { MergeRoomsCard } from "../components/RoomCard";
 import SearchBox from "../components/SearchBox";
+import SplitFloorDialog from "../components/SplitFloorDialog";
+import { DrawHint, FloorToolbar, useDrawLayer, type Tool } from "../components/FloorTools";
 import AddBuildingDialog from "../components/AddBuildingDialog";
 import { Empty, Spinner } from "../components/ui";
 import { useToast } from "../components/Toast";
@@ -64,7 +67,12 @@ export default function MapPage() {
   // Selected rooms; several when shift-clicking rooms to merge them. The last one is "the" room.
   const [selection, setSelection] = useState<RoomClick[]>([]);
   const room = selection.length ? selection[selection.length - 1] : null;
-  const setRoom = useCallback((r: RoomClick | null) => setSelection(r ? [r] : []), []);
+  // Walls and doors picked with an area selection, by map id ("<floor>:wall3").
+  const [wallSel, setWallSel] = useState<string[]>([]);
+  const setRoom = useCallback((r: RoomClick | null) => {
+    setSelection(r ? [r] : []);
+    setWallSel([]);
+  }, []);
   const uidOf = (r: RoomClick) => String(r.feature.id ?? r.feature.properties.uid);
   const floorOf = (r: RoomClick) => String(r.feature.properties.floor_id);
   const addRooms = useCallback((clicks: RoomClick[], toggle: boolean) => {
@@ -80,6 +88,18 @@ export default function MapPage() {
       return next;
     });
   }, []);
+  const addWalls = useCallback((ids: string[]) => {
+    setWallSel((sel) => {
+      const floor = (id: string) => id.split(":")[0];
+      const base = sel.length && ids.length && floor(sel[0]) !== floor(ids[0]) ? [] : sel;
+      return [...new Set([...base, ...ids])];
+    });
+  }, []);
+  // Editing tools on the map: area select, draw a room, split a room.
+  const [tool, setTool] = useState<Tool | null>(null);
+  const [drawPts, setDrawPts] = useState<[number, number][]>([]);
+  const [splitTarget, setSplitTarget] = useState<{ floorId: string; roomId: string } | null>(null);
+  const [cropFloorId, setCropFloorId] = useState<string | null>(null);
   const [hover, setHover] = useState<Hover | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -88,7 +108,7 @@ export default function MapPage() {
   const picking = pickMode !== null;
   const setPicking = (v: boolean) => setPickMode(v ? "new" : null);
   const [pendingRoom, setPendingRoom] = useState<{ floorId: string; roomId: string; stay?: boolean } | null>(null);
-  const [basemap, setBasemap] = useState<Basemap>(() => stored("floored.basemap", "streets"));
+  const [basemap, setBasemap] = useState<Basemap>(() => stored("floored.basemap", isDark() ? "dark" : "streets"));
   const [threeD, setThreeD] = useState(() => stored<string>("floored.3d", "0") === "1");
 
   const update = useCallback(
@@ -196,8 +216,27 @@ export default function MapPage() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.closest("input, textarea, select")) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey && !editFloorId) {
+        if (levelFloor?.undo && !undo.isPending) {
+          e.preventDefault();
+          undo.mutate(levelFloor.id);
+        }
+        return;
+      }
+      if (tool === "draw" || tool === "split") {
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          setDrawPts((p) => p.slice(0, -1));
+          return;
+        }
+        if (e.key === "Enter" && tool === "draw") {
+          finishDrawing();
+          return;
+        }
+      }
       if (e.key === "Escape") {
-        if (room) setRoom(null);
+        if (tool) stopTool();
+        else if (room || wallSel.length) setRoom(null);
         else if (picking) setPicking(false);
         return;
       }
@@ -215,7 +254,7 @@ export default function MapPage() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [level, levels, editFloorId, room, picking, update]);
+  });
 
   const outlinePick = useMutation({
     mutationFn: ([lon, lat]: [number, number]) =>
@@ -245,6 +284,81 @@ export default function MapPage() {
     onError: (e: Error) => toast.error("Couldn't add building", e.message),
   });
 
+  // The plan shown at the current level (each level has one).
+  const levelFloor = floorDetails.data?.find((f) => f.level === level) ?? null;
+  const stopTool = () => {
+    setTool(null);
+    setDrawPts([]);
+    setSplitTarget(null);
+  };
+  const chooseTool = (t: Tool | null) => {
+    setDrawPts([]);
+    if (t === "split") {
+      if (!room) return;
+      setSplitTarget({ floorId: floorOf(room), roomId: String(room.feature.properties.room_id) });
+    } else setSplitTarget(null);
+    if (t === "draw") setRoom(null);
+    setTool(t);
+  };
+  const undo = useMutation({
+    mutationFn: (floorId: string) => api.undoFloor(floorId),
+    onSuccess: async ({ undone }) => {
+      setRoom(null);
+      await qc.invalidateQueries();
+      toast.success(`Undid “${undone}”`);
+    },
+    onError: (e: Error) => toast.error("Couldn't undo", e.message),
+  });
+  const drawRoom = useMutation({
+    mutationFn: (ring: [number, number][]) => api.addRoom(levelFloor!.id, { ring }),
+    onSuccess: async ({ room_id, floor }) => {
+      stopTool();
+      await qc.invalidateQueries();
+      toast.success("Room added", "Give it a number.");
+      setPendingRoom({ floorId: floor.id, roomId: room_id, stay: true });
+    },
+    onError: (e: Error) => toast.error("Couldn't add the room", e.message),
+  });
+  const splitRoom = useMutation({
+    mutationFn: (line: [number, number][]) => api.splitRoom(splitTarget!.floorId, splitTarget!.roomId, line),
+    onSuccess: async ({ room_ids, floor }) => {
+      stopTool();
+      await qc.invalidateQueries();
+      toast.success(`Split into ${room_ids.length} rooms`, "Ctrl+Z puts it back.");
+      setPendingRoom({ floorId: floor.id, roomId: room_ids[room_ids.length - 1], stay: true });
+    },
+    onError: (e: Error) => {
+      setDrawPts([]);
+      toast.error("Couldn't split the room", e.message);
+    },
+  });
+  const finishDrawing = () => {
+    if (tool === "draw" && drawPts.length >= 3 && levelFloor && !drawRoom.isPending) drawRoom.mutate(drawPts);
+  };
+  const onToolClick = (ll: [number, number]) => {
+    if (tool === "split") {
+      const pts = [...drawPts, ll];
+      if (pts.length >= 2) {
+        setDrawPts(pts);
+        splitRoom.mutate(pts);
+      } else setDrawPts(pts);
+      return;
+    }
+    // Clicking near the first corner closes the room.
+    if (drawPts.length >= 3 && map) {
+      const a = map.project(drawPts[0]);
+      const b = map.project(ll);
+      if (Math.hypot(a.x - b.x, a.y - b.y) < 12) return finishDrawing();
+    }
+    setDrawPts((p) => [...p, ll]);
+  };
+  useDrawLayer(map, editFloorId ? null : tool, drawPts);
+  // Leaving the building or opening the placement editor puts the tools away.
+  useEffect(() => {
+    if (editFloorId || !buildingId) stopTool();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editFloorId, buildingId, level]);
+
   const editFloor = floorDetails.data?.find((f) => f.id === editFloorId) ?? null;
   const noBuildings = buildings.data?.length === 0;
   const selectRoomFromSearch = (r: { building_id: string; level: number; floor_id: string; room_id: string }) => {
@@ -266,10 +380,12 @@ export default function MapPage() {
         shellHeight={level === null ? 0 : elevationOf(level)}
         selectedBuildingId={buildingId}
         selectedRoomUids={selection.map(uidOf)}
+        selectedWallUids={wallSel}
+        areaSelect={tool === "select"}
         basemap={basemap}
         threeD={threeD && !editFloorId}
         hideRooms={!!editFloorId}
-        picking={picking}
+        picking={picking || tool === "draw" || tool === "split"}
         onReady={setMap}
         onHover={setHover}
         onSelectBuilding={(id) => {
@@ -278,8 +394,11 @@ export default function MapPage() {
           update({ b: id, l: null });
         }}
         onSelectRoom={(r, additive) => (r && additive ? addRooms([r], true) : setRoom(r))}
-        onSelectRooms={(clicks) => addRooms(clicks, false)}
-        onPick={(ll) => (pickMode === "new" ? pick.mutate(ll) : outlinePick.mutate(ll))}
+        onSelectRooms={(clicks, walls) => {
+          addRooms(clicks, false);
+          addWalls(walls);
+        }}
+        onPick={(ll) => (tool === "draw" || tool === "split" ? onToolClick(ll) : pickMode === "new" ? pick.mutate(ll) : outlinePick.mutate(ll))}
       />
       <HoverTip hover={hover} />
 
@@ -493,23 +612,52 @@ export default function MapPage() {
         <TokenNotice />
       </div>
 
-      {room && !editFloorId && (
+      {(room || wallSel.length > 0) && !editFloorId && (
         <div className="absolute right-16 top-3 z-10 md:bottom-6 md:top-auto">
-          {selection.length > 1 ? (
+          {selection.length > 1 || wallSel.length > 0 ? (
             <MergeRoomsCard
+              floorId={room ? floorOf(room) : wallSel[0].split(":")[0]}
               rooms={selection}
+              walls={wallSel}
               onRemove={(r) => addRooms([r], true)}
               onMerged={(floorId, roomId) => {
                 setRoom(null);
                 setPendingRoom({ floorId, roomId, stay: true });
               }}
+              onDeleted={() => setRoom(null)}
+              onDropWalls={() => setWallSel([])}
               onClose={() => setRoom(null)}
             />
           ) : (
-            <RoomCard room={room} buildingName={building.data?.name} onClose={() => setRoom(null)} />
+            room && <RoomCard room={room} buildingName={building.data?.name} onClose={() => setRoom(null)} onSplit={() => chooseTool("split")} />
           )}
         </div>
       )}
+
+      {/* Editing tools for the plan on this level */}
+      {building.data && levelFloor?.geojson && !editFloorId && !picking && (
+        <div className={clsx("absolute top-3 z-10 hidden -translate-x-1/2 flex-col items-center gap-2 md:flex", collapsed ? "left-1/2" : "left-[calc(50%+206px)]")}>
+          <FloorToolbar
+            tool={tool}
+            onTool={chooseTool}
+            canSplit={!!room && selection.length === 1}
+            undoLabel={levelFloor.undo}
+            onUndo={() => undo.mutate(levelFloor.id)}
+            onCrop={() => setCropFloorId(levelFloor.id)}
+          />
+          {tool && (
+            <DrawHint
+              tool={tool}
+              points={drawPts.length}
+              busy={drawRoom.isPending || splitRoom.isPending}
+              onDone={finishDrawing}
+              onBack={() => setDrawPts((p) => p.slice(0, -1))}
+              onCancel={stopTool}
+            />
+          )}
+        </div>
+      )}
+      {cropFloorId && <SplitFloorDialog floorId={cropFloorId} onClose={() => setCropFloorId(null)} />}
 
       {editFloorId && !editFloor && (
         <div className="panel absolute left-1/2 top-4 z-10 -translate-x-1/2 px-4 py-2 text-sm">
