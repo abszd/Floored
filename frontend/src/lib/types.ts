@@ -63,6 +63,7 @@ export interface Place {
   category: string | null;
   kind: string | null;
   footprint: Geometry | null;
+  address?: Record<string, string>;
 }
 
 /** What a name or address points to: a building we already have, or a new OSM place. */

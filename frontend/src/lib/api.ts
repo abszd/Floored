@@ -49,7 +49,23 @@ export const api = {
   health: () => request<{ converters: string[]; default_converter: string }>("/api/health"),
   geocode: (q: string, hint?: string | null) =>
     request<Place[]>(`/api/geocode?q=${encodeURIComponent(q)}${hint ? `&hint=${encodeURIComponent(hint)}` : ""}`),
-  lookup: (body: { name?: string | null; address?: string | null; hint?: string | null; exclude_building_id?: string }) =>
+  suggest: (q: string, near: { hint?: string | null; lat?: number; lon?: number } = {}, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ q });
+    if (near.hint) params.set("hint", near.hint);
+    if (near.lat != null && near.lon != null) {
+      params.set("lat", String(near.lat));
+      params.set("lon", String(near.lon));
+    }
+    return request<Place[]>(`/api/suggest?${params}`, { signal });
+  },
+  lookup: (body: {
+    name?: string | null;
+    address?: string | null;
+    hint?: string | null;
+    lat?: number;
+    lon?: number;
+    exclude_building_id?: string;
+  }) =>
     request<LookupResult>("/api/lookup", json("POST", body)),
   relocateBuilding: (id: string, body: { place: Place; address?: string }) =>
     request<Building>(`/api/buildings/${id}/relocate`, json("POST", body)),

@@ -239,3 +239,49 @@ def test_lookup_previews_without_creating(osm):
         assert found["building"] is None
         assert found["place"]["osm_id"] == "way/500" and found["place"]["footprint"]["type"] == "Polygon"
         assert client.get("/api/buildings").json() == []
+
+
+def test_suggestions_come_from_photon_near_the_hint(osm):
+    fake = osm(
+        nominatim={"Houghton, MI": [HOUGHTON]},
+        photon={
+            "1400 towns": [
+                {"geometry": {"type": "Point", "coordinates": [-88.5485, 47.1173]},
+                 "properties": {"osm_type": "N", "osm_id": 5, "osm_key": "place", "osm_value": "house",
+                                "housenumber": "1400", "street": "Townsend Drive", "city": "Houghton",
+                                "state": "Michigan", "postcode": "49931", "country": "United States"}}
+            ]
+        },
+    )
+    from floored.api.app import app
+
+    with TestClient(app) as client:
+        r = client.get("/api/suggest", params={"q": "1400 towns", "hint": "Houghton, MI"})
+        assert r.status_code == 200
+        [s] = r.json()
+        assert s["display_name"] == "1400 Townsend Drive, Houghton, Michigan, 49931, United States"
+        assert client.get("/api/suggest", params={"q": "14"}).json() == []  # too short to bother
+    assert "photon:1400 towns" in fake.queries
+
+
+def test_suggestions_never_error(settings):
+    http.set_transport(httpx.MockTransport(lambda req: httpx.Response(500)))
+    from floored.api.app import app
+
+    with TestClient(app) as client:
+        assert client.get("/api/suggest", params={"q": "1400 Townsend"}).json() == []
+
+
+def test_lookup_at_a_picked_suggestion_uses_the_building_there(osm):
+    osm(overpass=lambda q: [_way(500, MUB, building="university", name="Memorial Union Building")] if "around:25" in q else [])
+    from floored.api.app import app
+
+    with TestClient(app) as client:
+        r = client.post("/api/lookup", json={"lat": 47.1173, "lon": -88.5485, "address": "1400 Townsend Drive, Houghton, Michigan"})
+        assert r.status_code == 200, r.text
+        place = r.json()["place"]
+        assert place["osm_id"] == "way/500" and place["name"] == "Memorial Union Building"
+        assert place["footprint"]["type"] == "Polygon"
+        # Somewhere with no building: the bare point, labelled by the address.
+        bare = client.post("/api/lookup", json={"lat": 40.0, "lon": -88.0, "address": "5 Field Road, Nowhere"}).json()["place"]
+        assert bare["footprint"] is None and bare["name"] == "5 Field Road"
