@@ -11,7 +11,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from . import __version__
-from . import classify, fills, gaps, geometry, graph, rooms, style, text, walls
+from . import classify, fills, floor, gaps, geometry, graph, rooms, style, text, walls
 from .loading import load_image, make_working
 from .options import ConverterOptions
 from .result import ConversionResult, Door, Room, TextLabel, Wall
@@ -32,10 +32,40 @@ def convert(image, options: ConverterOptions = None, **kwargs) -> ConversionResu
     if kwargs:
         opts = ConverterOptions.from_kwargs(**{**asdict(opts), **kwargs})
     img = load_image(image, opts.pdf_page, opts.pdf_dpi)
-    return _convert(img, opts, opts.auto_crop)
+    res, items = _convert(img, opts, opts.auto_crop)
+    if opts.read_floor:
+        t = time.perf_counter()
+        res.meta["floor"] = _floor(image, img, items, res, opts)
+        timings = res.meta["timings_s"]
+        timings["floor"] = round(time.perf_counter() - t, 3)
+        timings["total"] = round(timings.get("total", 0.0) + timings["floor"], 3)
+    return res
 
 
-def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool) -> ConversionResult:
+def _floor(image, img: np.ndarray, items: list, res: ConversionResult, opts: ConverterOptions):
+    """Which floor the plan shows (see floor.py), from the PDF's own text when it has
+    some, else from the text read during conversion."""
+    pdf = floor.pdf_bytes(image)
+    if pdf is not None:
+        found = floor.floor_from_texts(floor.pdf_text_items(pdf, opts.pdf_page))
+        if found is not None and found["confidence"] >= 0.5:
+            return found
+    crop = res.meta.get("crop")
+    if crop is not None and res.meta.get("ocr_backend", "none") != "none":
+        # Only the crop around the plan was read; a title or floor number often sits
+        # beside it, so read the rest of the sheet too (big text, small image).
+        x0, y0, x1, y1 = crop
+        rest = img.copy()
+        rest[y0:y1, x0:x1] = 255
+        for it in floor.ocr_page(rest, text.get_backend(opts.ocr), max_size=1400):
+            cx, cy = it.center
+            if not (x0 <= cx < x1 and y0 <= cy < y1):
+                items.append(it)
+    return floor.floor_from_texts(items)
+
+
+def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool):
+    """Run the pipeline; returns the result and the text read (original pixels)."""
     timings = {}
     t_start = t = time.perf_counter()
 
@@ -58,12 +88,14 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool) -> Conversi
         # The plan fills only part of the sheet: run again on the plan alone, which
         # gets more working resolution for its thin lines.
         x0, y0, x1, y1 = box
-        res = _convert(img[y0:y1, x0:x1], opts, False)
+        res, items = _convert(img[y0:y1, x0:x1], opts, False)
         res = _translate(res, x0, y0, img.shape)
+        for it in items:
+            it.quad = it.quad + np.array([x0, y0], np.float64)
         res.meta["crop"] = [x0, y0, x1, y1]
         res.meta["timings_s"] = {**timings, **res.meta["timings_s"],
                                  "total": round(time.perf_counter() - t_start, 3)}
-        return res
+        return res, items
 
     backend = text.get_backend(opts.ocr)
     ocr_img = (255 - bgr) if sty.inverted else bgr
@@ -289,7 +321,7 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool) -> Conversi
         result.debug_images = debug.render(bgr, sty, tr, W, gr, soft, labels, out_rooms, scale)
         timings["debug"] = round(time.perf_counter() - t, 3)
     timings["total"] = round(time.perf_counter() - t_start, 3)
-    return result
+    return result, [text.TextItem(it.quad / scale, it.text, it.confidence) for it in tr.items]
 
 
 def _crop_box(bbox, scale: float, shape, opts: ConverterOptions):

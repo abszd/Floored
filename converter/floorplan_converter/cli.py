@@ -4,6 +4,7 @@
     floorplan-convert plan.pdf --page 2 -o out.json
     floorplan-convert plan.png --debug-dir debug/   # also write the debug images
     floorplan-convert plan.png --geojson --bounds 43.07,43.08,-89.41,-89.40
+    floorplan-convert plan.png --floor              # only which floor it shows (fast)
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import json
 import os
 import sys
 
-from . import __version__, convert, to_geojson
+from . import __version__, convert, read_floor, to_geojson
 
 
 def main(argv=None) -> int:
@@ -27,8 +28,20 @@ def main(argv=None) -> int:
     ap.add_argument("--debug-dir", help="write the intermediate images (PNG) to this folder")
     ap.add_argument("--geojson", action="store_true", help="print GeoJSON instead of the pixel result")
     ap.add_argument("--bounds", help="south,north,west,east in degrees; places the outline in this box")
+    ap.add_argument("--floor", action="store_true",
+                    help="only read which floor the plan shows (text pass, no rooms)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
+
+    if args.floor:
+        found = read_floor(args.image, ocr=args.ocr, pdf_page=args.page)
+        text = json.dumps(found, indent=1)
+        if args.output:
+            with open(args.output, "w") as fh:
+                fh.write(text)
+        else:
+            sys.stdout.write(text + "\n")
+        return 0
 
     res = convert(args.image, pdf_page=args.page, ocr=args.ocr, room_extent=args.extent,
                   debug=bool(args.debug_dir))

@@ -488,8 +488,8 @@ def generate(seed=0, style=None):
     # Window openings are part of the exterior wall, not of the room.
     gt[ext_wall & ~walls] = 0
 
-    names = {}
-    img = _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names)
+    names, info = {}, {}
+    img = _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names, info)
 
     rooms = []
     for rid in ids:
@@ -499,7 +499,7 @@ def generate(seed=0, style=None):
         rooms.append(SynthRoom(rid, kinds[rid - 1], names.get(rid, ""),
                                (int(xs_.min()), int(ys_.min()), int(xs_.max()), int(ys_.max()))))
 
-    plan = SynthPlan(img, gt, rooms, footprint, style, ppm, float(t_int), {"doors": doors, "windows": windows, "t_ext": t_ext})
+    plan = SynthPlan(img, gt, rooms, footprint, style, ppm, float(t_int), {"doors": doors, "windows": windows, "t_ext": t_ext, "floor": info["floor"]})
     if style == "scan":
         plan = _scan_effects(rng, plan)
     return plan
@@ -510,8 +510,9 @@ def generate(seed=0, style=None):
 # ---------------------------------------------------------------------------
 
 
-def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names):
-    """Draw the plan; the label written in each room goes into ``names`` (room id -> text)."""
+def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_int, t_ext, names, info):
+    """Draw the plan; the label written in each room goes into ``names`` (room id -> text)
+    and the floor it is on (its room numbers and title say) into ``info["floor"]``."""
     H, W = labels.shape
     ink = (0, 0, 0)
     thin = max(1, int(round(ppm / 30)))
@@ -602,6 +603,7 @@ def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_
     tscale = float(np.clip(ppm / 55 * rng.uniform(0.8, 1.2), 0.3, 1.0))
     tthick = 1 if tscale < 0.6 else 2
     number = int(rng.integers(1, 4)) * 100
+    info["floor"] = number // 100
     for rid in ids:
         m = (labels == rid) & ~walls
         ys, xs = np.nonzero(m)
@@ -654,7 +656,7 @@ def _render(rng, style, labels, kinds, walls, footprint, doors, windows, ppm, t_
         tb_w, tb_h = int(W * 0.28), int(min(H * 0.12, 3.5 * ppm))
         cv2.rectangle(img, (W - 7 - tb_w, H - 7 - tb_h), (W - 7, H - 7), ink, thin)
         cv2.line(img, (W - 7 - tb_w, H - 7 - tb_h // 2), (W - 7, H - 7 - tb_h // 2), ink, thin)
-        _put_text(img, "FLOOR PLAN - LEVEL 1", (W - 7 - tb_w / 2, H - 7 - tb_h * 0.75), tscale * 0.9, ink, tthick, font)
+        _put_text(img, f"FLOOR PLAN - LEVEL {info['floor']}", (W - 7 - tb_w / 2, H - 7 - tb_h * 0.75), tscale * 0.9, ink, tthick, font)
         _put_text(img, "SCALE 1:100   DWG A-101", (W - 7 - tb_w / 2, H - 7 - tb_h * 0.25), tscale * 0.7, ink, 1, font)
         _north_arrow(img, (int(14 + 1.5 * ppm), int(14 + 1.5 * ppm)), int(1.2 * ppm), ink, thin)
     if style == "gray_fill":

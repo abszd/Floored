@@ -13,12 +13,17 @@ result.outline                  # building footprint ring, original-image pixels
 for room in result.rooms:
     room.polygon, room.label, room.kind, room.area_px
 result.to_dict()                # plain dict (see "Output format")
+result.meta["floor"]            # {"label": "Second Floor", "level": 2.0, "confidence": 0.93, ...}
+
+from floorplan_converter import read_floor
+read_floor(open("plan.png", "rb").read())   # the floor alone, in about a second
 ```
 
 ```bash
 pip install -e converter            # or: pip install -e "converter[pdf,dev]"
 floorplan-convert plan.png > rooms.json
 floorplan-convert plan.pdf --page 1 --debug-dir debug/
+floorplan-convert plan.png --floor              # which floor it shows, nothing else
 ```
 
 ## What changed from the old converter
@@ -72,12 +77,35 @@ spans x = 10.0 to 20.0. Rings are not closed (the first point is not repeated).
 | `doors` | `[[[x, y], [x, y]]]` | Lines across each closed doorway; `door_widths_px` and `door_kinds` (`door`, or `opening` where a room was split at a narrow neck) run alongside. |
 | `texts` | list | Every text read: `{text, quad, confidence, room_id}`. |
 | `scale_hint` | float or `null` | Estimated pixels per metre, from the typical door width (0.9 m). Only given when enough doors were seen. |
-| `meta` | dict | Converter version, working scale, detected style, wall and door size, timings, and `crop` when the plan was cut out of a larger sheet. |
+| `meta` | dict | Converter version, working scale, detected style, wall and door size, timings, `crop` when the plan was cut out of a larger sheet, and `floor` (below). |
 | `debug_images` | `{name: png bytes}` | With `debug=True`: `text`, `walls`, `rooms`, `polygons`. Left out by `to_json_dict()`. |
 
 `kind: "outdoor"` marks unpainted areas inside a colour-filled plan: terraces,
 decks and courtyards drawn within the building's outline. They are rooms of a
 sort, but not part of the floor.
+
+### Which floor
+
+`meta["floor"]` (and `read_floor(image)`, which reads only the text and takes
+about a second) says which floor the plan shows, or is `None` when nothing on
+it does:
+
+| Key | |
+|---|---|
+| `label` | The floor's name as printed, tidied: `"Second Floor"`, `"Lower Level"`, `"Level 02"`, `"5R"`. `null` when the floor came from a bare number or from the room numbers. |
+| `level` | `1` first floor, `2` second, ...; `0` a floor called ground; `-1`, `-2` basements and lower levels; `+0.5` for a mezzanine (`2nd Floor Mezzanine` is `2.5`, a plain `Mezzanine` `1.5`). Main, street and plaza levels are `1`; an upper level is `2`. `null` for a roof plan. |
+| `confidence` | 0-1. Over 0.8 when two signs agree (a title and the room numbers); below 0.5 is a hint only. |
+| `text` | What it was read from: the title line, the mark, or the room numbers that voted. |
+| `source` | `title`, `mark` (a big lone `4`, `B`, `5R` beside the plan), `room_numbers`, or `title+room_numbers` / `mark+room_numbers` when they agree. |
+| `building` | Only when printed: the building's name from the title line (`"MEMORIAL UNION - SECOND FLOOR"`) or a big heading. |
+
+Room numbers count as a vote: `2218`, `(2220)` and `2206` are on floor 2,
+`B104` in the basement, `0110` below the first floor. Letters only mean a
+basement or ground floor when they are the only letters used (`A210`, `B210`,
+`C210` are wings on floor 2). A lone mark only counts when it is big, the only
+one on the page, and outside the room labels (so grid bubbles, floor pickers
+and a table drawn as `10` are ignored). PDFs with a text layer are read
+directly, without OCR.
 
 ### Putting it on a map
 
@@ -98,6 +126,7 @@ Pass as keyword arguments (`convert(img, debug=True, ocr="none")`) or as a
 | Option | Default | |
 |---|---|---|
 | `ocr` | `"auto"` | `auto`, `rapidocr`, `tesseract` or `none`. Without OCR, text is still removed but rooms have no labels. |
+| `read_floor` | `True` | Fill `meta["floor"]`. |
 | `room_extent` | `"interior"` | `interior`: floor inside the walls. `centerline`: rooms grown to the wall centre lines, tiling the building with no gaps. |
 | `auto_crop` | `True` | When the plan covers only part of the sheet, run again on a crop around it for more working resolution. |
 | `max_working_size` / `min_working_size` | 2600 / 1400 | Longest side the image is processed at. |
@@ -140,6 +169,9 @@ Pass as keyword arguments (`convert(img, debug=True, ocr="none")`) or as a
 7. **Labels and kinds** (`classify.py`): texts are assigned to the room they
    fall in; names and numbers are separated; kinds come from the label (and
    stair treads).
+   **Floor** (`floor.py`): titles, lone floor marks and room numbers are read
+   for which floor this is. When the plan was cropped from a sheet, the rest of
+   the sheet is read too (small and fast), since titles sit outside the plan.
 8. **Polygons** (`geometry.py`): traced, simplified and snapped to the plan's
    dominant axes, then mapped back to original-image pixels.
 
