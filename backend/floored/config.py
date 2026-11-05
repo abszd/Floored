@@ -19,6 +19,9 @@ class Settings:
     # converter package when it can be imported and falls back to "legacy".
     converter: str = field(default_factory=lambda: _env("CONVERTER", "auto"))
     nominatim_url: str = field(default_factory=lambda: _env("NOMINATIM_URL", "https://nominatim.openstreetmap.org"))
+    # Second geocoder, tried when Nominatim finds nothing (it is stricter about
+    # address spelling). Empty disables it.
+    photon_url: str = field(default_factory=lambda: _env("PHOTON_URL", "https://photon.komoot.io"))
     overpass_url: str = field(default_factory=lambda: _env("OVERPASS_URL", "https://overpass-api.de/api/interpreter"))
     # Nominatim and most sites require an identifying User-Agent with contact info.
     user_agent: str = field(default_factory=lambda: _env("USER_AGENT", "FlooredBot/0.1 (+https://github.com/abszd/Floored)"))

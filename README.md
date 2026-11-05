@@ -32,8 +32,8 @@ the product around it:
 
 | Piece | Where | What it does |
 |---|---|---|
-| Crawler | `backend/floored/scraper/` | Best-first crawl that follows links mentioning plans, buildings or facilities first; respects `robots.txt` and rate limits; renders PDF pages; scores each image with a plan-likeness heuristic (mostly white, colourless, long axis-aligned lines). |
-| Matching | `backend/floored/geo/matching.py` | Cleans names ("Engr. Hall – 3rd Floor Plan" → "engineering hall"), matches known buildings and aliases (including acronyms like "MU"), otherwise geocodes the address or name + location hint through Nominatim and scores the result. Confident matches are processed automatically; the rest wait in the review queue. |
+| Crawler | `backend/floored/scraper/` | Best-first crawl that reads the seed page's own section of the site first and follows links mentioning plans, buildings or facilities before others; respects `robots.txt` and rate limits; renders PDF pages; keeps an image only if it looks like a line drawing (long perpendicular lines on flat paper, no photographic shading), so photos of people and events are dropped. |
+| Matching | `backend/floored/geo/matching.py` | Cleans names ("Engr. Hall – 3rd Floor Plan" → "engineering hall") and matches known buildings and aliases (including acronyms like "MU"). Otherwise it looks for the OSM building carrying the page's street address, then an OSM building with that name near the address or in the hinted town, then falls back to geocoding (Nominatim, with simpler spellings of the address and Photon as retries). Confident matches are processed automatically; the rest wait in the review queue. |
 | Converter contract | `backend/floored/converters/base.py` | `image bytes → {image_size, outline, rooms[{id, polygon, holes, label, kind, area_px}], walls, doors, scale_hint}` in original-image pixels. `FLOORED_CONVERTER=auto` uses `converter/` when installed, else the legacy port. |
 | Placement | `backend/floored/placement/` | A placement is *centre, compass bearing, width and height in metres*: the old two-corner "GeoJSON resizer" plus rotation. `fit.py` tries the four axis alignments between the plan outline and the OSM footprint and polishes each with Nelder–Mead to maximise overlap (IoU), with a small penalty on non-uniform scale. Symmetric buildings are flagged for review because they fit equally well turned 180°. |
 | API | `backend/floored/api/app.py` | FastAPI; SQLite by default; background jobs for crawling and conversion. |
@@ -80,6 +80,7 @@ Environment variables (all optional):
 | `FLOORED_CONVERTER` | `auto` | `auto`, `floorplan_converter` or `legacy`. |
 | `FLOORED_USER_AGENT` | `FlooredBot/0.1 (+repo url)` | Nominatim's usage policy requires a real contact; set this to yours. |
 | `FLOORED_NOMINATIM_URL` / `FLOORED_OVERPASS_URL` | public OSM servers | Point these at your own instances for bulk use. |
+| `FLOORED_PHOTON_URL` | `https://photon.komoot.io` | Second geocoder, used when Nominatim finds nothing. Empty disables it. |
 | `FLOORED_AUTO_APPROVE` | `0.85` | Match confidence above which a found plan is processed without review. |
 | `FLOORED_CRAWL_DELAY` | `1.0` | Seconds between requests to the same site. |
 | `FLOORED_WORKERS` | `2` | Background job threads. |

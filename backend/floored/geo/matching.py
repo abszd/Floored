@@ -8,6 +8,7 @@ know, then geocode, and score how much we trust the result.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -140,50 +141,129 @@ def _place_score(place: geocoder.Place, wanted_name: str | None) -> float:
     return min(score, 1.0)
 
 
+def _search(query: str) -> list[geocoder.Place]:
+    try:
+        return geocoder.search(query, limit=5)
+    except Exception:
+        return []
+
+
+def _split_address(address: str) -> tuple[str, str] | None:
+    """("1400 Townsend Drive, Houghton, MI") -> ("1400", "Townsend Drive")."""
+    m = re.match(r"\s*(\d{1,6}[a-z]?)\s+([^,]+)", address, re.I)
+    return (m.group(1), m.group(2).strip()) if m else None
+
+
+def _osm_names(b: dict[str, Any]) -> list[str]:
+    tags = b.get("tags") or {}
+    return [tags[k] for k in ("name", "alt_name", "official_name", "short_name") if tags.get(k)] or ([b["name"]] if b.get("name") else [])
+
+
+def _from_outline(b: dict[str, Any], fallback_name: str | None, address: str | None) -> dict[str, Any]:
+    from shapely.geometry import shape
+
+    c = shape(b["footprint"]).centroid
+    name = b.get("name") or fallback_name or address or "Unnamed building"
+    return {
+        "name": name,
+        "display_name": ", ".join(dict.fromkeys(filter(None, [b.get("name"), address]))) or name,
+        "lat": c.y,
+        "lon": c.x,
+        "osm_id": b["osm_id"],
+        "footprint": b["footprint"],
+    }
+
+
+def _search_radius(place: geocoder.Place) -> float:
+    """How far around a city or neighbourhood hint to look for a named building."""
+    if not place.bbox:
+        return 3000.0
+    min_lon, min_lat, max_lon, max_lat = place.bbox
+    half_diag = 0.5 * math.hypot((max_lon - min_lon) * 111_320 * math.cos(math.radians(place.lat)), (max_lat - min_lat) * 111_320)
+    return float(min(max(half_diag, 1000.0), 8000.0))
+
+
 def resolve(
     building_name: str | None,
     address: str | None,
     location_hint: str | None,
     known: Iterable[KnownBuilding] = (),
 ) -> Match | None:
-    """Best guess for which building a plan belongs to, or ``None``."""
+    """Best guess for which building a plan belongs to, or ``None``.
+
+    Evidence is gathered in order of strength: a building we already have by
+    name; the OSM building carrying the page's street address; an OSM
+    building with that name near the address or inside the hinted area; and
+    finally whatever the geocoder makes of the name or address.
+    """
     known = list(known)
     if building_name:
         m = match_known(building_name, known)
         if m:
             return m
+    by_osm = {b.osm_id: b for b in known if b.osm_id}
+    name = re.sub(r"\s+", " ", _NOISE.sub(" ", building_name)).strip(" -–,") if building_name else ""
+    if building_name and not normalize_name(building_name):
+        name = ""
 
-    queries: list[tuple[str, float]] = []
+    # (score, place info for a new building, reason, geocoder place still needing an outline)
+    options: list[tuple[float, dict[str, Any], str, geocoder.Place | None]] = []
+
+    anchor: geocoder.Place | None = None
     if address:
         q = address if not location_hint or location_hint.lower() in address.lower() else f"{address}, {location_hint}"
-        queries.append((q, 0.15))  # an explicit address is worth a bonus
-    if building_name and normalize_name(building_name):
-        name = re.sub(r"\s+", " ", _NOISE.sub(" ", building_name)).strip(" -–,")
-        queries.append((f"{name}, {location_hint}" if location_hint else name, 0.0))
+        places = _search(q)
+        if places:
+            anchor = places[0]
+            for p in places[:3]:
+                options.append((min(1.0, _place_score(p, name or None) + 0.15), p.to_dict(), f"geocoded “{q}” to {p.display_name}", p))
+            parts = _split_address(address)
+            if parts:
+                try:
+                    b = footprints.building_at_address(*parts, anchor.lat, anchor.lon)
+                except Exception:
+                    b = None
+                if b:
+                    sim = max((name_similarity(name, n) for n in _osm_names(b)), default=0.0) if name else 0.5
+                    options.append((0.85 + 0.1 * sim, _from_outline(b, name, address), f"OSM building at {address}", None))
 
-    best: tuple[float, geocoder.Place, str] | None = None
-    for q, bonus in queries:
-        try:
-            places = geocoder.search(q, limit=5)
-        except Exception:
-            continue
-        for p in places:
-            s = min(1.0, _place_score(p, building_name) + bonus)
-            if best is None or s > best[0]:
-                best = (s, p, q)
-        if best and best[0] >= 0.9:
-            break
-    if best is None:
+    if name:
+        center, radius = anchor, 800.0
+        if center is None and location_hint:
+            hint_places = _search(location_hint)
+            if hint_places:
+                center, radius = hint_places[0], _search_radius(hint_places[0])
+        if center is not None:
+            try:
+                named = footprints.buildings_named(name, center.lat, center.lon, radius)
+            except Exception:
+                named = []
+            scored = sorted(
+                ((max(name_similarity(name, n) for n in _osm_names(b)), b) for b in named if _osm_names(b)),
+                key=lambda t: -t[0],
+            )
+            if scored and scored[0][0] >= 0.75:
+                sim, b = scored[0]
+                score = 0.5 + 0.45 * sim
+                if len(scored) > 1 and scored[1][0] >= sim - 0.05:
+                    score -= 0.15  # two buildings with the same name nearby
+                elif anchor is not None and b["distance_m"] < 400:
+                    score += 0.03
+                where = "near the address" if anchor is not None else f"in {location_hint}"
+                options.append((min(score, 0.97), _from_outline(b, name, address), f"OSM building “{b.get('name')}” {where}", None))
+
+        q = f"{name}, {location_hint}" if location_hint else name
+        for p in _search(q):
+            options.append((_place_score(p, name), p.to_dict(), f"geocoded “{q}” to {p.display_name}", p))
+
+    if not options:
         return None
+    score, info, reason, place = max(options, key=lambda o: o[0])
+    if info.get("osm_id") in by_osm:
+        b = by_osm[info["osm_id"]]
+        return Match(confidence=round(max(score, 0.9), 3), reason=f"{reason}: known building “{b.name}”", building_id=b.id)
 
-    score, place, query = best
-    by_osm = {b.osm_id: b for b in known if b.osm_id}
-    if place.osm_ref and place.osm_ref in by_osm:
-        b = by_osm[place.osm_ref]
-        return Match(confidence=round(max(score, 0.9), 3), reason=f"geocoded to known building “{b.name}”", building_id=b.id)
-
-    info = place.to_dict()
-    if not place.is_building:
+    if place is not None and not place.is_building:
         try:
             fp = footprints.footprint_at(place.lat, place.lon)
         except Exception:
@@ -196,6 +276,8 @@ def resolve(
                 b = by_osm[fp["osm_id"]]
                 return Match(confidence=round(score, 3), reason=f"point lies in known building “{b.name}”", building_id=b.id)
             score = min(1.0, score + (0.2 if fp["contains"] else 0.1))
-    if building_name and not info.get("name"):
-        info["name"] = building_name
-    return Match(confidence=round(score, 3), reason=f"geocoded “{query}” to {place.display_name}", place=info)
+        else:
+            info["footprint"] = None  # a campus or park outline is worse than none
+    if name and not info.get("name"):
+        info["name"] = name
+    return Match(confidence=round(score, 3), reason=reason, place=info)

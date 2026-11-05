@@ -63,13 +63,83 @@ def test_parse_page_scores_plan_links():
     assert not any("other.org" in u for u in links)
 
 
-def test_classifier_separates_plans_from_photos():
+def _plan_image():
     png, _ = draw_plan()
-    plan = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
-    rng = np.random.default_rng(1)
-    photo = cv2.GaussianBlur(rng.integers(0, 255, (600, 900, 3), dtype=np.uint8), (15, 15), 0)
-    assert classify.plan_likeness(plan) > 0.6
-    assert classify.plan_likeness(photo) < 0.4
+    return cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _photo(h, w, seed=3):
+    """Smooth continuous-tone shading with sensor noise, like a photo."""
+    rng = np.random.default_rng(seed)
+    base = cv2.resize(rng.integers(0, 255, (h // 40, w // 40, 3)).astype(np.uint8), (w, h), interpolation=cv2.INTER_CUBIC)
+    return np.clip(base.astype(np.int16) + rng.integers(-6, 7, (h, w, 3)), 0, 255).astype(np.uint8)
+
+
+def _flyer():
+    """An event flyer: a photo of people on a white page with a frame and text."""
+    page = np.full((1100, 850, 3), 255, np.uint8)
+    page[150:650, 175:675] = _photo(500, 500)
+    cv2.rectangle(page, (40, 40), (810, 1060), (0, 0, 0), 3)
+    for i in range(6):
+        cv2.putText(page, "Student activities fair - join us Thursday", (60, 740 + 50 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 2)
+    return page
+
+
+def _facade():
+    """A building photographed head-on: a grid of windows under a sky gradient."""
+    rng = np.random.default_rng(4)
+    img = np.zeros((600, 900, 3), np.uint8)
+    for y in range(600):
+        img[y] = (230 - y // 6, 200 - y // 8, 160 - y // 10)
+    for x in range(80, 820, 90):
+        for y in range(200, 560, 80):
+            cv2.rectangle(img, (x, y), (x + 50, y + 50), (60, 70, 80), -1)
+    img = np.clip(img.astype(np.int16) + rng.integers(-8, 9, img.shape), 0, 255).astype(np.uint8)
+    return cv2.GaussianBlur(img, (3, 3), 0)
+
+
+def _tilted(img, deg):
+    h, w = img.shape[:2]
+    return cv2.warpAffine(img, cv2.getRotationMatrix2D((w / 2, h / 2), deg, 1), (w, h), borderValue=(255, 255, 255))
+
+
+def _jpeg(img, q=70):
+    return cv2.imdecode(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_plan_image, lambda: _jpeg(_plan_image()), lambda: _tilted(_plan_image(), 3.5),
+     lambda: cv2.resize(_plan_image(), (450, 300), interpolation=cv2.INTER_AREA),
+     lambda: 255 - _plan_image()],  # white lines on black, like a blueprint
+    ids=["plan", "jpeg", "tilted", "small", "inverted"],
+)
+def test_classifier_accepts_plans(make):
+    assert classify.plan_likeness(make()) > 0.6
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: _photo(600, 900), _flyer, lambda: _jpeg(_flyer()), _facade],
+    ids=["photo", "flyer", "flyer-jpeg", "facade"],
+)
+def test_classifier_rejects_photos(make):
+    assert classify.plan_likeness(make()) < 0.3
+
+
+def test_photo_file_names_rank_below_plans():
+    html = """<title>Floor Plans | Memorial Union Building | Michigan Tech</title>
+    <h1>Floor Plans</h1>
+    <img src="/mub/IMG_2041.jpg" alt="Students at the activities fair">
+    <img src="/mub/events-hero.jpg">
+    <a href="/mub/mub-basement.pdf"><img src="/mub/mub-basement.jpg" alt="Basement"></a>"""
+    info = parse_page("https://www.mtu.edu/mub/", html, ["mtu.edu"])
+    score = {a.url.rsplit("/", 1)[-1]: a.score for a in info.assets}
+    assert score["IMG_2041.jpg"] < 0.3 and score["events-hero.jpg"] < 0.3  # not downloaded
+    assert score["mub-basement.pdf"] >= 0.6
+    plan = next(a for a in info.assets if a.url.endswith(".pdf"))
+    assert plan.building_guess == "Memorial Union Building"
+    assert plan.level == (-1.0, "Basement")
 
 
 def _site():
@@ -109,3 +179,22 @@ def test_crawl_finds_plan_and_skips_photo(settings):
 def test_robots_respected(settings):
     http.set_transport(httpx.MockTransport(_site()))
     assert not Fetcher(delay_s=0).allowed("https://uni.example.edu/private/x")
+
+
+def test_crawl_stays_in_the_seed_section_first(settings):
+    visited = []
+    pages = {
+        "/facilities/plans/": '<a href="/news/student-center-gala">Student center gala</a>'
+        '<a href="/facilities/plans/union-building">Union building</a>',
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        visited.append(request.url.path)
+        return httpx.Response(200, html=pages.get(request.url.path, "<p>nothing</p>"))
+
+    http.set_transport(httpx.MockTransport(handler))
+    cfg = CrawlConfig(["https://uni.example.edu/facilities/plans/"], [], max_pages=2)
+    list(crawl(cfg, fetcher=Fetcher(delay_s=0)))
+    assert visited == ["/facilities/plans/", "/facilities/plans/union-building"]

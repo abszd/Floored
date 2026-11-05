@@ -23,6 +23,8 @@ from .fetch import Fetcher
 MIN_TEXT_SCORE = 0.3
 # Image score a downloaded page needs to be kept.
 MIN_PLAN_SCORE = 0.45
+# Priority taken off links that leave the seed's part of the site.
+OFF_SECTION_PENALTY = 0.4
 
 
 @dataclass
@@ -47,6 +49,14 @@ class CrawlConfig:
     max_pages: int = 200
     max_depth: int = 3
     max_assets: int = 300
+
+
+def _section(url: str) -> str:
+    parts = urlsplit(url)
+    path = parts.path if parts.path.endswith("/") else parts.path.rsplit("/", 1)[0] + "/"
+    if path.count("/") > 3:  # keep a deep seed's parent section in reach
+        path = path.rstrip("/").rsplit("/", 1)[0] + "/"
+    return f"{parts.scheme}://{parts.netloc}{path}"
 
 
 def _domains(cfg: CrawlConfig) -> list[str]:
@@ -74,6 +84,9 @@ def crawl(
         counter += 1
     assets: list[tuple[AssetLink, str, str]] = []
     pages = 0
+    # The section of the site each seed lives in ("/memorialunion/about/"):
+    # pages there are read before the rest of a big university site.
+    sections = {_section(u) for u in cfg.seed_urls}
 
     def report(msg: str) -> None:
         if progress:
@@ -105,6 +118,8 @@ def crawl(
         if depth < cfg.max_depth:
             for link, prio in info.links:
                 if link not in seen_pages:
+                    if not any(link.startswith(sec) for sec in sections):
+                        prio -= OFF_SECTION_PENALTY
                     heapq.heappush(queue, (-prio + 0.1 * depth, depth + 1, counter, link))
                     counter += 1
 

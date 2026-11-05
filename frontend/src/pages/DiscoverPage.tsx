@@ -326,9 +326,10 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
   );
 
   const choose = useMutation({
-    mutationFn: async (target: { buildingId?: string; place?: Parameters<typeof api.createBuilding>[0]["place"] }) => {
+    mutationFn: async (target: { buildingId?: string; place?: Parameters<typeof api.createBuilding>[0]["place"]; address?: string }) => {
       let id = target.buildingId;
-      if (!id) id = (await api.createBuilding({ place: target.place })).id;
+      if (!id && target.place) id = (await api.createBuilding({ place: target.place })).id;
+      if (!id && target.address) id = (await api.createBuilding({ address: target.address, name: candidate.building_guess ?? undefined })).id;
       return api.updateCandidate(candidate.id, { building_id: id });
     },
     onSuccess: () => {
@@ -350,6 +351,16 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
         ))}
         {filtered.length === 0 && <div className="px-3 py-2 text-sm text-slate-500">None of your buildings match.</div>}
       </div>
+      {candidate.address_guess && (
+        <button
+          className="btn-secondary mt-3 w-full justify-start"
+          disabled={choose.isPending}
+          onClick={() => choose.mutate({ address: candidate.address_guess! })}
+        >
+          {choose.isPending ? <Spinner /> : <MapPin className="h-4 w-4" />}
+          <span className="truncate">Use the address on the page: {candidate.address_guess}</span>
+        </button>
+      )}
       <div className="mt-4 border-t border-slate-100 pt-4">
         <label className="label">Or find it on OpenStreetMap</label>
         <form
@@ -370,6 +381,11 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
               <span className="truncate text-xs text-slate-500">{p.display_name}</span>
             </button>
           ))}
+          {places.data?.length === 0 && (
+            <button className="btn-secondary w-full justify-start" disabled={choose.isPending} onClick={() => choose.mutate({ address: geoQ })}>
+              {choose.isPending && <Spinner />} No exact match. Find the building at this address
+            </button>
+          )}
         </div>
       </div>
     </Modal>
