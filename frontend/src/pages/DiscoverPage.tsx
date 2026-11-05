@@ -5,7 +5,8 @@ import { Check, ExternalLink, Globe, Play, Plus, RefreshCw, Search, Trash2, X, I
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
-import type { Candidate, Source } from "../lib/types";
+import type { Building, Candidate, Place, Source } from "../lib/types";
+import PlacePreviewMap from "../components/PlacePreviewMap";
 import { ConfidenceBar, Empty, Modal, Spinner } from "../components/ui";
 import { useToast } from "../components/Toast";
 
@@ -313,23 +314,35 @@ function CandidateCard({ c, onZoom }: { c: Candidate; onZoom: () => void }) {
   );
 }
 
+type Pick = { building: Building; place?: undefined } | { place: Place; building?: undefined };
+
 function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; onClose: () => void }) {
   const qc = useQueryClient();
   const toast = useToast();
   const [q, setQ] = useState(candidate.building_guess ?? "");
   const [geoQ, setGeoQ] = useState("");
+  const [pick, setPick] = useState<Pick | null>(null);
+  const hint = candidate.location_hint;
   const buildings = useQuery({ queryKey: ["buildings"], queryFn: api.buildings });
-  const places = useQuery({ queryKey: ["geocode", geoQ], queryFn: () => api.geocode(geoQ), enabled: geoQ.length > 1 });
+  const places = useQuery({ queryKey: ["geocode", geoQ, hint], queryFn: () => api.geocode(geoQ, hint), enabled: geoQ.length > 1 });
   const filtered = useMemo(
     () => (buildings.data ?? []).filter((b) => !q || `${b.name} ${b.address ?? ""} ${b.aliases.join(" ")}`.toLowerCase().includes(q.toLowerCase())),
     [buildings.data, q],
   );
 
-  const choose = useMutation({
-    mutationFn: async (target: { buildingId?: string; place?: Parameters<typeof api.createBuilding>[0]["place"]; address?: string }) => {
-      let id = target.buildingId;
-      if (!id && target.place) id = (await api.createBuilding({ place: target.place })).id;
-      if (!id && target.address) id = (await api.createBuilding({ address: target.address, name: candidate.building_guess ?? undefined })).id;
+  const lookup = useMutation({
+    mutationFn: (address: string) => api.lookup({ name: candidate.building_guess, address, hint }),
+    onSuccess: (r) => setPick(r.building ? { building: r.building } : r.place ? { place: r.place } : null),
+    onError: (e: Error) => toast.error("Couldn't find that address", e.message),
+  });
+  const pickBuilding = useMutation({
+    mutationFn: (id: string) => api.building(id),
+    onSuccess: (b) => setPick({ building: b }),
+  });
+
+  const confirm = useMutation({
+    mutationFn: async (p: Pick) => {
+      const id = p.building ? p.building.id : (await api.createBuilding({ place: p.place, name: candidate.building_guess ?? undefined })).id;
       return api.updateCandidate(candidate.id, { building_id: id });
     },
     onSuccess: () => {
@@ -339,30 +352,53 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
     onError: (e: Error) => toast.error("Couldn't set building", e.message),
   });
 
+  const where = pick?.building ?? pick?.place;
+
   return (
     <Modal title="Which building is this?" onClose={onClose}>
+      {candidate.address_guess && (
+        <button className="btn-secondary mb-3 w-full justify-start" disabled={lookup.isPending} onClick={() => lookup.mutate(candidate.address_guess!)}>
+          {lookup.isPending ? <Spinner /> : <MapPin className="h-4 w-4" />}
+          <span className="truncate">
+            Use the address on the page: {candidate.address_guess}
+            {hint && !candidate.address_guess.toLowerCase().includes(hint.toLowerCase()) ? ` (${hint})` : ""}
+          </span>
+        </button>
+      )}
+
+      {where && pick && (
+        <div className="mb-4 space-y-2 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3">
+          <PlacePreviewMap place={where} />
+          <div className="text-sm">
+            <div className="font-medium">{pick.building ? pick.building.name : pick.place.name || pick.place.display_name.split(",")[0]}</div>
+            <div className="text-xs text-slate-500">
+              {pick.building ? `${pick.building.address ?? ""} · already on your map` : pick.place.display_name}
+              {!where.footprint && " · no building outline, so this plan will need placing by hand"}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button className="btn-primary" disabled={confirm.isPending} onClick={() => confirm.mutate(pick)}>
+              {confirm.isPending && <Spinner />} Use this building
+            </button>
+            <button className="btn-ghost" onClick={() => setPick(null)}>
+              Not this one
+            </button>
+          </div>
+        </div>
+      )}
+
       <input autoFocus className="input" placeholder="Filter your buildings" value={q} onChange={(e) => setQ(e.target.value)} />
       <div className="mt-2 max-h-56 space-y-1 overflow-auto">
         {filtered.map((b) => (
-          <button key={b.id} onClick={() => choose.mutate({ buildingId: b.id })} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
+          <button key={b.id} onClick={() => pickBuilding.mutate(b.id)} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
             <span className="text-sm font-medium">{b.name}</span>
             <span className="truncate text-xs text-slate-500">{b.address}</span>
           </button>
         ))}
         {filtered.length === 0 && <div className="px-3 py-2 text-sm text-slate-500">None of your buildings match.</div>}
       </div>
-      {candidate.address_guess && (
-        <button
-          className="btn-secondary mt-3 w-full justify-start"
-          disabled={choose.isPending}
-          onClick={() => choose.mutate({ address: candidate.address_guess! })}
-        >
-          {choose.isPending ? <Spinner /> : <MapPin className="h-4 w-4" />}
-          <span className="truncate">Use the address on the page: {candidate.address_guess}</span>
-        </button>
-      )}
       <div className="mt-4 border-t border-slate-100 pt-4">
-        <label className="label">Or find it on OpenStreetMap</label>
+        <label className="label">Or find it on OpenStreetMap{hint ? ` (results in ${hint} first)` : ""}</label>
         <form
           className="flex gap-2"
           onSubmit={(e) => {
@@ -376,14 +412,14 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
         {places.isFetching && <Spinner className="mt-2" />}
         <div className="mt-2 space-y-1">
           {places.data?.map((p) => (
-            <button key={`${p.osm_id}-${p.lat}`} onClick={() => choose.mutate({ place: p })} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
+            <button key={`${p.osm_id}-${p.lat}`} onClick={() => setPick({ place: p })} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
               <span className="text-sm font-medium">{p.name || p.display_name.split(",")[0]}</span>
               <span className="truncate text-xs text-slate-500">{p.display_name}</span>
             </button>
           ))}
           {places.data?.length === 0 && (
-            <button className="btn-secondary w-full justify-start" disabled={choose.isPending} onClick={() => choose.mutate({ address: geoQ })}>
-              {choose.isPending && <Spinner />} No exact match. Find the building at this address
+            <button className="btn-secondary w-full justify-start" disabled={lookup.isPending} onClick={() => lookup.mutate(geoQ)}>
+              {lookup.isPending && <Spinner />} No exact match. Find the building at this address
             </button>
           )}
         </div>

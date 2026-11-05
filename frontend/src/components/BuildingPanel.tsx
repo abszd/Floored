@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Check, ExternalLink, Image as ImageIcon, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Layers } from "lucide-react";
+import { ArrowLeft, ExternalLink, Image as ImageIcon, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Layers } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
 import type { Building, FloorSummary } from "../lib/types";
 import AddFloorDialog from "./AddFloorDialog";
+import EditBuildingDialog from "./EditBuildingDialog";
 import { Empty, Modal, StatusBadge } from "./ui";
 import { useToast } from "./Toast";
 
@@ -21,18 +22,10 @@ export default function BuildingPanel({ building, level, onLevel, onBack, onEdit
   const qc = useQueryClient();
   const toast = useToast();
   const [adding, setAdding] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [name, setName] = useState(building.name);
+  const [editing, setEditing] = useState(false);
   const [preview, setPreview] = useState<FloorSummary | null>(null);
   const floors = [...building.floors].sort((a, b) => b.level - a.level);
 
-  const rename = useMutation({
-    mutationFn: () => api.updateBuilding(building.id, { name }),
-    onSuccess: () => {
-      qc.invalidateQueries();
-      setRenaming(false);
-    },
-  });
   const remove = useMutation({
     mutationFn: () => api.deleteBuilding(building.id),
     onSuccess: () => {
@@ -48,28 +41,15 @@ export default function BuildingPanel({ building, level, onLevel, onBack, onEdit
         <button className="btn-ghost -ml-2 mb-2 px-2 py-1 text-xs" onClick={onBack}>
           <ArrowLeft className="h-3.5 w-3.5" /> All buildings
         </button>
-        {renaming ? (
-          <form
-            className="flex gap-2"
-            onSubmit={(e) => {
-              e.preventDefault();
-              rename.mutate();
-            }}
-          >
-            <input autoFocus className="input" value={name} onChange={(e) => setName(e.target.value)} />
-            <button className="btn-primary px-2.5">
-              <Check className="h-4 w-4" />
-            </button>
-          </form>
-        ) : (
-          <div className="group flex items-start gap-2">
-            <h1 className="text-lg font-semibold leading-tight">{building.name}</h1>
-            <button className="mt-0.5 text-slate-300 opacity-0 transition group-hover:opacity-100 hover:text-slate-500" onClick={() => setRenaming(true)} title="Rename">
-              <Pencil className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
-        {building.address && <div className="mt-1 text-sm text-slate-500">{building.address}</div>}
+        <div className="group flex items-start gap-2">
+          <h1 className="text-lg font-semibold leading-tight">{building.name}</h1>
+          <button className="mt-0.5 text-slate-400 hover:text-slate-600" onClick={() => setEditing(true)} title="Edit name and address">
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <button className="mt-1 block text-left text-sm text-slate-500 hover:text-slate-700" onClick={() => setEditing(true)}>
+          {building.address || <span className="text-indigo-600">Add an address</span>}
+        </button>
         {!building.has_footprint && (
           <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
             No building outline from OpenStreetMap, so plans can't snap into place automatically. You can still place them by hand.
@@ -112,6 +92,7 @@ export default function BuildingPanel({ building, level, onLevel, onBack, onEdit
       </div>
 
       {adding && <AddFloorDialog building={building} onClose={() => setAdding(false)} />}
+      {editing && <EditBuildingDialog building={building} onClose={() => setEditing(false)} />}
       {preview && <FloorImages floorId={preview.id} title={preview.name} onClose={() => setPreview(null)} />}
     </div>
   );

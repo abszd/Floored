@@ -65,6 +65,14 @@ export interface Place {
   footprint: Geometry | null;
 }
 
+/** What a name or address points to: a building we already have, or a new OSM place. */
+export interface LookupResult {
+  confidence: number;
+  reason: string;
+  building: Building | null;
+  place: Place | null;
+}
+
 export interface Source {
   id: string;
   name: string;
@@ -91,6 +99,7 @@ export interface Candidate {
   plan_score: number;
   building_guess: string | null;
   address_guess: string | null;
+  location_hint: string | null;
   level_guess: number | null;
   level_label: string | null;
   building_id: string | null;

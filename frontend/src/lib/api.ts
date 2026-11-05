@@ -1,4 +1,5 @@
 import type {
+  LookupResult,
   Building,
   BuildingSummary,
   Candidate,
@@ -46,7 +47,12 @@ export const mediaUrl = (path: string | null | undefined) => (path ? BASE + path
 
 export const api = {
   health: () => request<{ converters: string[]; default_converter: string }>("/api/health"),
-  geocode: (q: string) => request<Place[]>(`/api/geocode?q=${encodeURIComponent(q)}`),
+  geocode: (q: string, hint?: string | null) =>
+    request<Place[]>(`/api/geocode?q=${encodeURIComponent(q)}${hint ? `&hint=${encodeURIComponent(hint)}` : ""}`),
+  lookup: (body: { name?: string | null; address?: string | null; hint?: string | null; exclude_building_id?: string }) =>
+    request<LookupResult>("/api/lookup", json("POST", body)),
+  relocateBuilding: (id: string, body: { place: Place; address?: string }) =>
+    request<Building>(`/api/buildings/${id}/relocate`, json("POST", body)),
   footprintAt: (lat: number, lon: number) =>
     request<{ osm_id: string; name: string | null; footprint: Place["footprint"]; contains: boolean } | null>(
       `/api/footprint?lat=${lat}&lon=${lon}`,

@@ -17,7 +17,7 @@ const STYLES: Record<Basemap, string> = {
 
 // Used without a Mapbox token, or when Mapbox can't be reached, so buildings
 // and rooms still show on a plain background.
-const FALLBACK_STYLE: mapboxgl.StyleSpecification = {
+export const FALLBACK_STYLE: mapboxgl.StyleSpecification = {
   version: 8,
   glyphs: "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf",
   sources: {},
