@@ -17,6 +17,8 @@ export interface FloorSummary {
   building_id: string;
   name: string;
   level: number;
+  /** Why the level may be wrong (it was guessed, or another plan had it). */
+  level_note: string | null;
   status: FloorStatus;
   error: string | null;
   fit_score: number | null;
@@ -47,6 +49,10 @@ export interface BuildingSummary {
   floor_count: number;
   placed_count: number;
   review_count: number;
+  /** Separate pieces in the building's outline (wings mapped apart in OSM). */
+  outline_parts: number;
+  /** Plans that share a level with another plan (and so would overlap). */
+  shared_levels: number;
 }
 
 export interface Building extends BuildingSummary {
@@ -110,18 +116,71 @@ export interface Candidate {
   status: CandidateStatus;
   floor_id: string | null;
   error: string | null;
+  draft_id: string | null;
+}
+
+/** Where we think a temp building is: one already on the map, or a place from OpenStreetMap. */
+export interface DraftSuggestion {
+  confidence: number;
+  reason: string;
+  chosen: boolean;
+  place: Place | null;
+  building: Building | null;
+}
+
+/** Found plans grouped by the building they seem to show, before it is on the map. */
+export interface Draft {
+  id: string;
+  source_id: string | null;
+  source_name: string | null;
+  location_hint: string | null;
+  name: string;
+  address: string | null;
+  match_state: "pending" | "done";
+  suggestion: DraftSuggestion | null;
+  /** Set once confirmed; leftover plans can still be added to it. */
+  building: Building | null;
+  page_urls: string[];
+  candidates: Candidate[];
+}
+
+/** Live numbers a crawl reports while it runs. */
+export interface CrawlDetail {
+  phase?: "reading" | "checking" | "matching" | "finished";
+  pages_read?: number;
+  max_pages?: number;
+  pages_waiting?: number;
+  files_found?: number;
+  files_checked?: number;
+  files_total?: number;
+  plans_found?: number;
+  buildings_found?: number;
+  buildings_matched?: number;
+  current?: string | null;
+  current_url?: string | null;
 }
 
 export interface Job {
   id: string;
   kind: string;
-  status: "queued" | "running" | "done" | "failed";
+  label: string;
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress: number;
   message: string | null;
+  detail: CrawlDetail;
+  stop_requested: boolean;
   payload: Record<string, unknown>;
   result: Record<string, unknown>;
   created_at: string;
+  started_at: string | null;
   finished_at: string | null;
+}
+
+export interface Activity {
+  running: Job[];
+  queued: Job[];
+  recent: Job[];
+  workers: number;
 }
 
 export interface SearchResult {

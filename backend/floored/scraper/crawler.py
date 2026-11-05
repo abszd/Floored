@@ -70,8 +70,16 @@ def crawl(
     *,
     fetcher: Fetcher | None = None,
     skip_assets: Iterable[str] = (),
-    progress: Callable[[float, str], None] | None = None,
+    progress: Callable[[float, str, dict], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Iterator[FoundPlan]:
+    """Yield floor plans as they are found.
+
+    ``progress(fraction, message, detail)`` is told what the crawl is doing:
+    ``detail`` has the phase ("reading" pages, then "checking" files), counts,
+    and the page or file being looked at. ``should_stop()`` ends the crawl
+    early; plans already yielded stand.
+    """
     fetcher = fetcher or Fetcher()
     domains = _domains(cfg)
     skip = set(skip_assets)
@@ -88,12 +96,28 @@ def crawl(
     # pages there are read before the rest of a big university site.
     sections = {_section(u) for u in cfg.seed_urls}
 
-    def report(msg: str) -> None:
-        if progress:
-            done = min(pages / max(cfg.max_pages, 1), 1.0)
-            progress(0.6 * done, msg)
+    stats = {
+        "phase": "reading",
+        "pages_read": 0,
+        "max_pages": cfg.max_pages,
+        "pages_waiting": 0,
+        "files_found": 0,
+        "files_checked": 0,
+        "files_total": 0,
+        "plans_found": 0,
+        "current": None,
+        "current_url": None,
+    }
 
-    while queue and pages < cfg.max_pages:
+    def report(fraction: float, msg: str, **changes) -> None:
+        stats.update(changes)
+        if progress:
+            progress(fraction, msg, dict(stats))
+
+    def stopping() -> bool:
+        return bool(should_stop and should_stop())
+
+    while queue and pages < cfg.max_pages and not stopping():
         _, depth, _, url = heapq.heappop(queue)
         if url in seen_pages:
             continue
@@ -111,10 +135,18 @@ def crawl(
         if resp is None or resp.status >= 400 or not resp.is_html:
             continue
         info = parse_page(resp.url, resp.text, domains)
-        report(f"Read {pages} pages, {len(assets)} possible plans: {info.title or url}")
         for a in info.assets:
             if a.score >= MIN_TEXT_SCORE and a.url not in skip:
                 assets.append((a, info.url, info.title))
+        report(
+            0.6 * min(pages / max(cfg.max_pages, 1), 1.0),
+            f"Reading page {pages} of up to {cfg.max_pages}: {info.title or url}",
+            pages_read=pages,
+            pages_waiting=len(queue),
+            files_found=len({a.url for a, _, _ in assets}),
+            current=info.title or url,
+            current_url=resp.url,
+        )
         if depth < cfg.max_depth:
             for link, prio in info.links:
                 if link not in seen_pages:
@@ -129,10 +161,21 @@ def crawl(
         if a.url not in unique or a.score > unique[a.url][0].score:
             unique[a.url] = (a, page_url, title)
     ranked = sorted(unique.values(), key=lambda t: -t[0].score)[: cfg.max_assets]
+    report(0.6, f"Read {pages} pages; checking {len(ranked)} files", phase="checking", pages_read=pages,
+           pages_waiting=len(queue), files_total=len(ranked), files_found=len(unique))
 
+    found = 0
     for i, (a, page_url, title) in enumerate(ranked):
-        if progress:
-            progress(0.6 + 0.4 * i / max(len(ranked), 1), f"Checking {a.url.rsplit('/', 1)[-1]}")
+        if stopping():
+            break
+        report(
+            0.6 + 0.4 * i / max(len(ranked), 1),
+            f"Checking file {i + 1} of {len(ranked)}: {a.url.rsplit('/', 1)[-1]}",
+            files_checked=i,
+            plans_found=found,
+            current=a.url.rsplit("/", 1)[-1] or a.url,
+            current_url=a.url,
+        )
         resp = fetcher.get(a.url)
         if resp is None or resp.status >= 400:
             continue
@@ -151,6 +194,8 @@ def crawl(
             # Multi-page PDFs usually have one floor per page, named in the page text.
             level = parse_level(page.text) if page.text else None
             level = level or a.level
+            found += 1
+            stats["plans_found"] = found
             yield FoundPlan(
                 asset_url=a.url,
                 page_index=page.index,
@@ -164,3 +209,5 @@ def crawl(
                 level=level[0] if level else None,
                 level_label=level[1] if level else None,
             )
+    report(1.0, f"Checked {len(ranked)} files, {found} floor plans", files_checked=len(ranked), plans_found=found,
+           current=None, current_url=None)

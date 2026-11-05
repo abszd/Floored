@@ -47,7 +47,7 @@ export default function PlacePreviewMap({ place, current, className = "h-48" }: 
         id: "spot-fill",
         type: "fill",
         source: "spots",
-        filter: ["==", ["geometry-type"], "Polygon"],
+        filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
         paint: { "fill-color": ["match", ["get", "role"], "new", "#6366f1", "#94a3b8"], "fill-opacity": 0.3 },
         ...slot,
       });
@@ -55,7 +55,7 @@ export default function PlacePreviewMap({ place, current, className = "h-48" }: 
         id: "spot-line",
         type: "line",
         source: "spots",
-        filter: ["==", ["geometry-type"], "Polygon"],
+        filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
         paint: {
           "line-color": ["match", ["get", "role"], "new", "#4338ca", "#64748b"],
           "line-width": 2,
@@ -84,7 +84,13 @@ export default function PlacePreviewMap({ place, current, className = "h-48" }: 
         map.setStyle(FALLBACK_STYLE);
       }
     });
-    return () => map.remove();
+    // Follow the box's size (cards grow and shrink with the picture-size slider).
+    const ro = new ResizeObserver(() => map.resize());
+    ro.observe(container.current!);
+    return () => {
+      ro.disconnect();
+      map.remove();
+    };
   }, []);
 
   useEffect(() => {

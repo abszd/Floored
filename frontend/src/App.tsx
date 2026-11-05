@@ -2,39 +2,10 @@ import { NavLink, Route, Routes } from "react-router-dom";
 import { Map as MapIcon, Radar } from "lucide-react";
 import MapPage from "./pages/MapPage";
 import DiscoverPage from "./pages/DiscoverPage";
-import { JOB_LABELS, useJobs } from "./lib/jobs";
-import { Spinner } from "./components/ui";
-import { useState } from "react";
+import ActivityPanel, { ActivityButton } from "./components/ActivityPanel";
 import { useQuery } from "@tanstack/react-query";
 import { ServerOff } from "lucide-react";
 import { api } from "./lib/api";
-
-function JobsIndicator() {
-  const { active, labels } = useJobs();
-  const [open, setOpen] = useState(false);
-  if (!active.length) return null;
-  return (
-    <div className="relative">
-      <button className="btn-ghost text-xs" onClick={() => setOpen((o) => !o)}>
-        <Spinner className="text-indigo-600" />
-        {active.length} running
-      </button>
-      {open && (
-        <div className="panel absolute right-0 top-full z-50 mt-1 w-72 p-2" onMouseLeave={() => setOpen(false)}>
-          {active.map((j) => (
-            <div key={j.id} className="rounded-lg px-2 py-1.5">
-              <div className="text-sm font-medium">{labels[j.id] ?? JOB_LABELS[j.kind] ?? j.kind}</div>
-              <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-100">
-                <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${Math.max(4, j.progress * 100)}%` }} />
-              </div>
-              {j.message && <div className="mt-1 truncate text-[11px] text-slate-500">{j.message}</div>}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
 /** The static site is useless without the API; say so plainly instead of showing empty lists. */
 function BackendBanner() {
@@ -68,8 +39,9 @@ export default function App() {
           </NavLink>
         </nav>
         <div className="flex-1" />
-        <JobsIndicator />
+        <ActivityButton />
       </header>
+      <ActivityPanel />
       <BackendBanner />
       <main className="min-h-0 flex-1">
         <Routes>

@@ -1,58 +1,105 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
-import type { Job } from "./types";
+import type { Activity, Job } from "./types";
 import { useToast } from "../components/Toast";
 
+interface TrackOptions {
+  onDone?: (job: Job) => void;
+  /** Don't toast when it finishes (one of many jobs started together). */
+  quiet?: boolean;
+}
+
 interface JobsContext {
-  track: (jobId: string, label: string, onDone?: (job: Job) => void) => void;
+  track: (jobId: string, label: string, opts?: TrackOptions | ((job: Job) => void)) => void;
+  /** Running and queued jobs. */
   active: Job[];
-  labels: Record<string, string>;
+  activity: Activity | undefined;
+  panelOpen: boolean;
+  setPanelOpen: (open: boolean) => void;
 }
 
 const Ctx = createContext<JobsContext | null>(null);
 
-/** Polls running jobs, refreshes data when they finish, and reports the outcome. */
+/** What a finished crawl found, in words. */
+export function crawlSummary(job: Job): string {
+  const r = job.result as { found?: number; buildings?: number; auto_buildings?: number; to_review?: number; stopped?: boolean };
+  if (r.found == null) return job.message ?? "";
+  if (!r.found) return r.stopped ? "Stopped early. No floor plans found yet." : "No new floor plans found.";
+  const parts = [`${r.found} plan${r.found === 1 ? "" : "s"} in ${r.buildings} building${r.buildings === 1 ? "" : "s"}`];
+  if (r.auto_buildings) parts.push(`${r.auto_buildings} put on the map`);
+  if (r.to_review) parts.push(`${r.to_review} to review`);
+  return (r.stopped ? "Stopped early. " : "") + parts.join(", ") + ".";
+}
+
+/** Polls the background workers, refreshes data as jobs finish, and reports outcomes. */
 export function JobsProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const [tracked, setTracked] = useState<Record<string, string>>({});
+  const [tracked, setTracked] = useState<Record<string, { label: string; quiet?: boolean }>>({});
+  const [panelOpen, setPanelOpen] = useState(false);
   const callbacks = useRef<Record<string, (job: Job) => void>>({});
+  const seenDone = useRef<Set<string> | null>(null);
 
-  const { data: active = [] } = useQuery({
-    queryKey: ["jobs", "active"],
-    queryFn: () => api.jobs(true),
-    refetchInterval: (q) => ((q.state.data?.length ?? 0) > 0 || Object.keys(tracked).length > 0 ? 1500 : 15000),
+  const { data: activity } = useQuery({
+    queryKey: ["activity"],
+    queryFn: api.activity,
+    refetchInterval: (q) => {
+      const a = q.state.data;
+      const busy = (a?.running.length ?? 0) + (a?.queued.length ?? 0) > 0 || Object.keys(tracked).length > 0;
+      return busy ? 1500 : panelOpen ? 5000 : 15000;
+    },
   });
+  const active = useMemo(() => [...(activity?.running ?? []), ...(activity?.queued ?? [])], [activity]);
 
-  // Anything we tracked that is no longer active has finished: fetch its outcome.
+  // While a crawl runs, its plans and temp buildings appear as they're found.
+  const crawling = active.some((j) => j.kind === "crawl" && j.status === "running");
+  const plansFound = active.reduce((n, j) => n + (j.detail.plans_found ?? 0), 0);
   useEffect(() => {
-    const activeIds = new Set(active.map((j) => j.id));
-    for (const id of Object.keys(tracked)) {
-      if (activeIds.has(id)) continue;
-      api.job(id).then((job) => {
-        if (job.status === "queued" || job.status === "running") return;
-        const label = tracked[id];
-        setTracked(({ [id]: _, ...rest }) => rest);
-        qc.invalidateQueries();
-        if (job.status === "done") toast.success(`${label} finished`);
-        else toast.error(`${label} failed`, job.message ?? undefined);
-        callbacks.current[id]?.(job);
-        delete callbacks.current[id];
-      });
+    if (crawling) {
+      qc.invalidateQueries({ queryKey: ["drafts"] });
+      qc.invalidateQueries({ queryKey: ["sources"] });
     }
-  }, [active, tracked, qc, toast]);
+  }, [crawling, plansFound, qc]);
+
+  // Anything that finished since the last poll: refresh, and report the ones we started.
+  useEffect(() => {
+    if (!activity) return;
+    const finished = activity.recent;
+    if (seenDone.current === null) {
+      seenDone.current = new Set(finished.map((j) => j.id));
+      return;
+    }
+    let changed = false;
+    for (const job of finished) {
+      if (seenDone.current.has(job.id)) continue;
+      seenDone.current.add(job.id);
+      changed = true;
+      const t = tracked[job.id];
+      if (t) {
+        setTracked(({ [job.id]: _, ...rest }) => rest);
+        if (!t.quiet) {
+          if (job.status === "done") toast.success(`${t.label} finished`, job.kind === "crawl" ? crawlSummary(job) : undefined);
+          else if (job.status === "failed") toast.error(`${t.label} failed`, job.message ?? undefined);
+        }
+        callbacks.current[job.id]?.(job);
+        delete callbacks.current[job.id];
+      }
+    }
+    if (changed) qc.invalidateQueries();
+  }, [activity, tracked, qc, toast]);
 
   const track = useCallback(
-    (jobId: string, label: string, onDone?: (job: Job) => void) => {
-      setTracked((t) => ({ ...t, [jobId]: label }));
-      if (onDone) callbacks.current[jobId] = onDone;
-      qc.invalidateQueries({ queryKey: ["jobs", "active"] });
+    (jobId: string, label: string, opts?: TrackOptions | ((job: Job) => void)) => {
+      const o = typeof opts === "function" ? { onDone: opts } : (opts ?? {});
+      setTracked((t) => ({ ...t, [jobId]: { label, quiet: o.quiet } }));
+      if (o.onDone) callbacks.current[jobId] = o.onDone;
+      qc.invalidateQueries({ queryKey: ["activity"] });
     },
     [qc],
   );
 
-  const value = useMemo(() => ({ track, active, labels: tracked }), [track, active, tracked]);
+  const value = useMemo(() => ({ track, active, activity, panelOpen, setPanelOpen }), [track, active, activity, panelOpen]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
@@ -61,10 +108,3 @@ export function useJobs() {
   if (!ctx) throw new Error("useJobs outside JobsProvider");
   return ctx;
 }
-
-export const JOB_LABELS: Record<string, string> = {
-  crawl: "Crawl",
-  process_floor: "Floor plan conversion",
-  approve_candidate: "Floor plan conversion",
-  match_candidates: "Building matching",
-};

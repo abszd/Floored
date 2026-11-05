@@ -69,6 +69,13 @@ def normalize_name(name: str) -> str:
     return " ".join(words).strip()
 
 
+def clean_name(name: str | None) -> str:
+    """A scraped building name without the words about the drawing ("Engineering Hall")."""
+    if not name or not normalize_name(name):
+        return ""
+    return re.sub(r"\s+", " ", _NOISE.sub(" ", name)).strip(" -–,")
+
+
 def find_addresses(text: str) -> list[str]:
     """Street addresses mentioned in free text, in order of appearance."""
     seen, out = set(), []
@@ -214,9 +221,7 @@ def resolve(
     finally whatever the geocoder makes of the name or address.
     """
     known = list(known)
-    name = re.sub(r"\s+", " ", _NOISE.sub(" ", building_name)).strip(" -–,") if building_name else ""
-    if building_name and not normalize_name(building_name):
-        name = ""
+    name = clean_name(building_name)
 
     # Where the plan is: the hinted town, then the page's street address within it.
     area: geocoder.Place | None = None

@@ -12,7 +12,7 @@ import MapView, { FLOOR_HEIGHT_M, type Basemap, type Hover, type RoomClick } fro
 import { HoverTip, MapControls, TokenNotice } from "../components/MapChrome";
 import BuildingPanel from "../components/BuildingPanel";
 import PlacementEditor from "../components/PlacementEditor";
-import RoomCard from "../components/RoomCard";
+import RoomCard, { MergeRoomsCard } from "../components/RoomCard";
 import SearchBox from "../components/SearchBox";
 import AddBuildingDialog from "../components/AddBuildingDialog";
 import { Empty, Spinner } from "../components/ui";
@@ -61,12 +61,33 @@ export default function MapPage() {
   const levelParam = params.get("l");
   const editFloorId = params.get("edit");
   const [map, setMap] = useState<MBMap | null>(null);
-  const [room, setRoom] = useState<RoomClick | null>(null);
+  // Selected rooms; several when shift-clicking rooms to merge them. The last one is "the" room.
+  const [selection, setSelection] = useState<RoomClick[]>([]);
+  const room = selection.length ? selection[selection.length - 1] : null;
+  const setRoom = useCallback((r: RoomClick | null) => setSelection(r ? [r] : []), []);
+  const uidOf = (r: RoomClick) => String(r.feature.id ?? r.feature.properties.uid);
+  const floorOf = (r: RoomClick) => String(r.feature.properties.floor_id);
+  const addRooms = useCallback((clicks: RoomClick[], toggle: boolean) => {
+    setSelection((sel) => {
+      // Rooms can only be merged within one floor plan; a room from another starts over.
+      let next = clicks.length && sel.length && floorOf(sel[0]) !== floorOf(clicks[0]) ? [] : [...sel];
+      for (const c of clicks) {
+        const i = next.findIndex((r) => uidOf(r) === uidOf(c));
+        if (i >= 0) {
+          if (toggle) next = next.filter((_, j) => j !== i);
+        } else if (!next.length || floorOf(next[0]) === floorOf(c)) next.push(c);
+      }
+      return next;
+    });
+  }, []);
   const [hover, setHover] = useState<Hover | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [adding, setAdding] = useState(false);
-  const [picking, setPicking] = useState(false);
-  const [pendingRoom, setPendingRoom] = useState<{ floorId: string; roomId: string } | null>(null);
+  // Clicking the map: to add a new building, or to add/remove a part of the open building's outline.
+  const [pickMode, setPickMode] = useState<null | "new" | "add" | "remove">(null);
+  const picking = pickMode !== null;
+  const setPicking = (v: boolean) => setPickMode(v ? "new" : null);
+  const [pendingRoom, setPendingRoom] = useState<{ floorId: string; roomId: string; stay?: boolean } | null>(null);
   const [basemap, setBasemap] = useState<Basemap>(() => stored("floored.basemap", "streets"));
   const [threeD, setThreeD] = useState(() => stored<string>("floored.3d", "0") === "1");
 
@@ -103,6 +124,8 @@ export default function MapPage() {
     queryKey: ["floors", floors.map((f) => `${f.id}:${f.updated_at}`).join(",")],
     queryFn: () => Promise.all(floors.map((f) => api.floor(f.id))),
     enabled: floors.length > 0,
+    // Keep showing the old rooms while edited ones load, instead of an empty map.
+    placeholderData: (prev) => (prev && prev.every((f) => floors.some((x) => x.id === f.id)) ? prev : undefined),
   });
   const rooms = useMemo<FeatureCollection | undefined>(() => {
     if (!floorDetails.data) return undefined;
@@ -164,7 +187,7 @@ export default function MapPage() {
     const c = boundsOf([f.geometry])?.getCenter();
     if (c) {
       setRoom({ feature: f as RoomClick["feature"], lngLat: [c.lng, c.lat] });
-      map.flyTo({ center: c, zoom: 19.5 });
+      if (!pendingRoom.stay) map.flyTo({ center: c, zoom: 19.5 });
     }
     setPendingRoom(null);
   }, [pendingRoom, rooms, map]);
@@ -193,6 +216,17 @@ export default function MapPage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [level, levels, editFloorId, room, picking, update]);
+
+  const outlinePick = useMutation({
+    mutationFn: ([lon, lat]: [number, number]) =>
+      pickMode === "remove" ? api.removeOutlinePart(buildingId!, lat, lon) : api.addOutlinePart(buildingId!, lat, lon),
+    onSuccess: (b: Building) => {
+      qc.invalidateQueries();
+      toast.success(pickMode === "remove" ? "Part removed from the outline" : "Part added to the outline", b.floors.length ? "Floor plans were fitted to the new outline." : undefined);
+      setPickMode(null);
+    },
+    onError: (e: Error) => toast.error("Couldn't change the outline", e.message),
+  });
 
   const pick = useMutation({
     mutationFn: async ([lon, lat]: [number, number]) => {
@@ -231,7 +265,7 @@ export default function MapPage() {
         elevation={level === null ? 0 : elevationOf(level)}
         shellHeight={level === null ? 0 : elevationOf(level)}
         selectedBuildingId={buildingId}
-        selectedRoomUid={room ? String(room.feature.id ?? room.feature.properties.uid) : null}
+        selectedRoomUids={selection.map(uidOf)}
         basemap={basemap}
         threeD={threeD && !editFloorId}
         hideRooms={!!editFloorId}
@@ -243,15 +277,20 @@ export default function MapPage() {
           setRoom(null);
           update({ b: id, l: null });
         }}
-        onSelectRoom={setRoom}
-        onPick={(ll) => pick.mutate(ll)}
+        onSelectRoom={(r, additive) => (r && additive ? addRooms([r], true) : setRoom(r))}
+        onSelectRooms={(clicks) => addRooms(clicks, false)}
+        onPick={(ll) => (pickMode === "new" ? pick.mutate(ll) : outlinePick.mutate(ll))}
       />
       <HoverTip hover={hover} />
 
       {picking && (
         <div className="panel absolute left-1/2 top-4 z-20 flex -translate-x-1/2 items-center gap-3 px-4 py-2.5 text-sm">
-          {pick.isPending ? <Spinner /> : <Building2 className="h-4 w-4 text-indigo-600" />}
-          Click a building on the map to add it
+          {pick.isPending || outlinePick.isPending ? <Spinner /> : <Building2 className="h-4 w-4 text-indigo-600" />}
+          {pickMode === "add"
+            ? "Click the shape on the map that belongs to this building"
+            : pickMode === "remove"
+              ? "Click the part of the outline to take away"
+              : "Click a building on the map to add it"}
           <button className="btn-ghost px-2 py-1 text-xs" onClick={() => setPicking(false)}>
             Cancel
           </button>
@@ -290,6 +329,7 @@ export default function MapPage() {
                   const f = floors.find((x) => x.id === fid);
                   update({ edit: fid, l: f ? String(f.level) : null });
                 }}
+                onPickOutline={(mode) => setPickMode(mode)}
               />
             </>
           ) : (
@@ -382,8 +422,8 @@ export default function MapPage() {
 
       {/* Floor switcher, like an elevator panel */}
       {building.data && levels.length > 0 && !editFloorId && (
-        <div className="absolute right-3 top-3 z-10 flex flex-col items-center gap-1">
-          <div className="panel flex flex-col overflow-hidden p-1">
+        <div className="group/levels absolute right-3 top-3 z-10 flex flex-col items-center gap-1">
+          <div className="panel flex flex-col p-1">
             <button
               className="flex h-6 w-10 items-center justify-center text-slate-400 hover:text-slate-700 disabled:opacity-30"
               disabled={level === levels[0]}
@@ -395,19 +435,32 @@ export default function MapPage() {
             {levels.map((l) => {
               const fl = floors.filter((f) => f.level === l);
               const review = fl.some((f) => f.status === "needs_review");
+              const check = fl.some((f) => f.level_note) || fl.length > 1;
               return (
-                <button
-                  key={l}
-                  onClick={() => changeLevel(l)}
-                  className={clsx(
-                    "relative h-10 w-10 rounded-lg text-sm font-semibold transition",
-                    l === level ? "bg-indigo-600 text-white shadow" : "text-slate-600 hover:bg-slate-100",
-                  )}
-                  title={fl.map((f) => f.name).join(", ")}
-                >
-                  {levelShort(l)}
-                  {review && <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-amber-500" />}
-                </button>
+                <div key={l} className="relative">
+                  <button
+                    onClick={() => changeLevel(l)}
+                    className={clsx(
+                      "relative h-10 w-10 rounded-lg text-sm font-semibold transition",
+                      l === level ? "bg-indigo-600 text-white shadow" : "text-slate-600 hover:bg-slate-100",
+                    )}
+                    title={[fl.map((f) => f.name).join(", "), ...fl.map((f) => f.level_note).filter(Boolean)].join(" · ")}
+                  >
+                    {levelShort(l)}
+                    {review && <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-amber-500" />}
+                    {check && <span className="absolute bottom-1 right-1 text-[9px] font-bold text-amber-500">?</span>}
+                  </button>
+                  {/* Floor names, shown beside the panel: the current one always, the rest on hover. */}
+                  <span
+                    className={clsx(
+                      "pointer-events-none absolute right-full top-1/2 mr-2 -translate-y-1/2 whitespace-nowrap rounded-md px-2 py-0.5 text-xs shadow-sm transition",
+                      l === level ? "bg-indigo-600 text-white opacity-100" : "bg-white text-slate-700 opacity-0 group-hover/levels:opacity-100",
+                    )}
+                  >
+                    {fl.map((f) => f.name).join(" + ")}
+                    {check && " (check level)"}
+                  </span>
+                </div>
               );
             })}
             <button
@@ -442,7 +495,19 @@ export default function MapPage() {
 
       {room && !editFloorId && (
         <div className="absolute right-16 top-3 z-10 md:bottom-6 md:top-auto">
-          <RoomCard room={room} buildingName={building.data?.name} onClose={() => setRoom(null)} />
+          {selection.length > 1 ? (
+            <MergeRoomsCard
+              rooms={selection}
+              onRemove={(r) => addRooms([r], true)}
+              onMerged={(floorId, roomId) => {
+                setRoom(null);
+                setPendingRoom({ floorId, roomId, stay: true });
+              }}
+              onClose={() => setRoom(null)}
+            />
+          ) : (
+            <RoomCard room={room} buildingName={building.data?.name} onClose={() => setRoom(null)} />
+          )}
         </div>
       )}
 

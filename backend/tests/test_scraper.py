@@ -198,3 +198,26 @@ def test_crawl_stays_in_the_seed_section_first(settings):
     cfg = CrawlConfig(["https://uni.example.edu/facilities/plans/"], [], max_pages=2)
     list(crawl(cfg, fetcher=Fetcher(delay_s=0)))
     assert visited == ["/facilities/plans/", "/facilities/plans/union-building"]
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+
+    from floored import config, db
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE jobs (id VARCHAR(32) PRIMARY KEY, kind VARCHAR(64), status VARCHAR(16), progress FLOAT, "
+                "message TEXT, payload JSON, result JSON, created_at DATETIME, started_at DATETIME, finished_at DATETIME)")
+    con.execute("INSERT INTO jobs (id, kind, status, progress, payload) VALUES ('a', 'crawl', 'done', 1, '{}')")
+    con.commit()
+    con.close()
+    config.override_settings(config.Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{path}"))
+    db.reset_engine()
+    try:
+        db.init_db()
+        cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(jobs)")}
+        assert {"detail", "stop_requested"} <= cols
+        assert "draft_id" in {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(candidates)")}
+    finally:
+        db.reset_engine()

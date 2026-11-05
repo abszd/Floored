@@ -1,18 +1,18 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ExternalLink, Globe, Play, Plus, RefreshCw, Search, Trash2, X, Inbox, Wand2, MapPin } from "lucide-react";
+import { ExternalLink, Globe, Image as ImageIcon, Inbox, MapPin, Pencil, Play, Plus, RefreshCw, Trash2, Wand2 } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
-import type { Building, Candidate, Place, Source } from "../lib/types";
-import AddressInput from "../components/AddressInput";
-import PlacePreviewMap from "../components/PlacePreviewMap";
+import type { Candidate, Draft, Source } from "../lib/types";
+import { CrawlCard } from "../components/ActivityPanel";
+import DraftCard, { draftTarget } from "../components/DraftCard";
 import { ConfidenceBar, Empty, Modal, Spinner } from "../components/ui";
 import { useToast } from "../components/Toast";
 
 const TABS = [
-  { key: "review", label: "To review", status: "matched,unmatched,new,error" },
+  { key: "review", label: "To review", status: "" },
   { key: "approved", label: "Processing", status: "approved" },
   { key: "done", label: "On the map", status: "processed" },
   { key: "rejected", label: "Rejected", status: "rejected" },
@@ -27,13 +27,24 @@ export default function DiscoverPage() {
     if (!v && params.has("add")) setParams({}, { replace: true });
   };
   const [zoom, setZoom] = useState<Candidate | null>(null);
+  const [thumb, setThumb] = useThumbSize();
+  const { active } = useJobs();
   const sources = useQuery({ queryKey: ["sources"], queryFn: api.sources });
   const status = TABS.find((t) => t.key === tab)!.status;
+  const crawling = active.some((j) => j.kind === "crawl");
+  const drafts = useQuery({
+    queryKey: ["drafts"],
+    queryFn: () => api.drafts(),
+    enabled: tab === "review",
+    refetchInterval: crawling || active.some((j) => j.kind === "match_candidates") ? 3000 : false,
+  });
   const candidates = useQuery({
     queryKey: ["candidates", status],
     queryFn: () => api.candidates(status),
+    enabled: tab !== "review",
     refetchInterval: tab === "approved" ? 2000 : false,
   });
+  const reviewCount = drafts.data?.length;
 
   return (
     <div className="mx-auto flex h-full max-w-7xl flex-col gap-6 overflow-y-auto p-6 lg:flex-row">
@@ -66,23 +77,54 @@ export default function DiscoverPage() {
             {TABS.map((t) => (
               <button key={t.key} onClick={() => setTab(t.key)} className={`rounded-md px-3 py-1 ${tab === t.key ? "bg-white font-medium shadow-sm" : "text-slate-500"}`}>
                 {t.label}
+                {t.key === "review" && reviewCount ? <span className="ml-1 text-xs text-slate-400">{reviewCount}</span> : null}
               </button>
             ))}
           </div>
-          {tab === "review" && candidates.data && candidates.data.length > 0 && <BulkApprove candidates={candidates.data} />}
+          {tab === "review" && drafts.data && <ConfirmConfident drafts={drafts.data} />}
+          <div className="flex-1" />
+          <label className="flex items-center gap-2 text-xs text-slate-500" title="How big the floor plan pictures are">
+            <ImageIcon className="h-3.5 w-3.5" />
+            <input type="range" min={80} max={320} step={10} value={thumb} onChange={(e) => setThumb(Number(e.target.value))} className="w-28 accent-indigo-600" aria-label="Picture size" />
+            <ImageIcon className="h-5 w-5" />
+          </label>
         </div>
 
-        {candidates.isLoading && <Spinner className="h-6 w-6 text-slate-400" />}
-        {candidates.data?.length === 0 && (
-          <div className="card">
-            <Empty icon={<Inbox className="h-5 w-5" />} title={tab === "review" ? "Nothing to review" : "Nothing here yet"}>
-              {tab === "review" ? "Add a website and run a crawl to find floor plans." : null}
-            </Empty>
-          </div>
+        {tab === "review" ? (
+          <>
+            {drafts.isLoading && <Spinner className="h-6 w-6 text-slate-400" />}
+            {drafts.data?.length === 0 && (
+              <div className="card">
+                <Empty icon={<Inbox className="h-5 w-5" />} title={crawling ? "Looking for floor plans…" : "Nothing to review"}>
+                  {crawling ? "Plans show up here, grouped by building, as the crawler finds them." : "Add a website and run a crawl to find floor plans."}
+                </Empty>
+              </div>
+            )}
+            {!!drafts.data?.length && (
+              <p className="mb-3 text-xs text-slate-500">
+                Plans are grouped into temp buildings by the name on the page. Check where each one is, fix the address if needed, and
+                confirm to put all its floors on the map at once.
+              </p>
+            )}
+            <div className="grid items-start gap-4" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${Math.max(340, thumb * 2.3 + 40)}px), 1fr))` }}>
+              {drafts.data?.map((d) => (
+                <DraftCard key={d.id} draft={d} others={drafts.data!.filter((o) => o.source_id === d.source_id)} thumb={thumb} onZoom={setZoom} />
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            {candidates.isLoading && <Spinner className="h-6 w-6 text-slate-400" />}
+            {candidates.data?.length === 0 && (
+              <div className="card">
+                <Empty icon={<Inbox className="h-5 w-5" />} title="Nothing here yet" />
+              </div>
+            )}
+            <div className="grid gap-4" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, ${thumb + 100}px), 1fr))` }}>
+              {candidates.data?.map((c) => <CandidateCard key={c.id} c={c} onZoom={() => setZoom(c)} />)}
+            </div>
+          </>
         )}
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3">
-          {candidates.data?.map((c) => <CandidateCard key={c.id} c={c} onZoom={() => setZoom(c)} />)}
-        </div>
       </section>
 
       {addingSource && <AddSourceDialog onClose={() => setAddingSource(false)} />}
@@ -98,12 +140,14 @@ export default function DiscoverPage() {
 
 function SourceCard({ source }: { source: Source }) {
   const qc = useQueryClient();
-  const { track, active } = useJobs();
+  const { track, active, setPanelOpen } = useJobs();
+  const [editing, setEditing] = useState(false);
   const running = active.find((j) => j.kind === "crawl" && j.payload.source_id === source.id);
   const crawl = useMutation({
     mutationFn: () => api.crawl(source.id),
     onSuccess: ({ job_id }) => track(job_id, `Crawl of ${source.name}`),
   });
+  const queuedAt = active.filter((j) => j.status === "queued").findIndex((j) => j.id === running?.id);
   const remove = useMutation({ mutationFn: () => api.deleteSource(source.id), onSuccess: () => qc.invalidateQueries() });
   const counts = source.candidate_counts;
   const found = Object.values(counts).reduce((a, b) => a + b, 0);
@@ -116,16 +160,23 @@ function SourceCard({ source }: { source: Source }) {
           <div className="truncate text-sm font-medium">{source.name}</div>
           <div className="truncate text-xs text-slate-500">{source.seed_urls[0]}</div>
         </div>
-        <button className="text-slate-300 hover:text-rose-500" onClick={() => confirm(`Remove ${source.name} and its findings?`) && remove.mutate()}>
+        <button className="text-slate-300 hover:text-slate-600" onClick={() => setEditing(true)} title="Edit">
+          <Pencil className="h-3.5 w-3.5" />
+        </button>
+        <button className="text-slate-300 hover:text-rose-500" onClick={() => confirm(`Remove ${source.name} and its findings?`) && remove.mutate()} title="Remove">
           <Trash2 className="h-3.5 w-3.5" />
         </button>
       </div>
       {running ? (
         <div className="mt-3">
-          <div className="h-1.5 overflow-hidden rounded-full bg-slate-100">
-            <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${Math.max(4, running.progress * 100)}%` }} />
-          </div>
-          <div className="mt-1 truncate text-[11px] text-slate-500">{running.message ?? "Starting…"}</div>
+          {running.status === "queued" ? (
+            <div className="text-[11px] text-slate-500">Waiting to start{queuedAt > 0 ? ` (${queuedAt} job${queuedAt > 1 ? "s" : ""} ahead)` : ""}…</div>
+          ) : (
+            <CrawlCard job={running} compact />
+          )}
+          <button className="mt-1 text-[11px] text-indigo-600 hover:underline" onClick={() => setPanelOpen(true)}>
+            Show all activity
+          </button>
         </div>
       ) : (
         <div className="mt-3 flex items-center justify-between">
@@ -139,19 +190,37 @@ function SourceCard({ source }: { source: Source }) {
           </button>
         </div>
       )}
+      {editing && <AddSourceDialog source={source} onClose={() => setEditing(false)} />}
     </div>
   );
 }
 
-function AddSourceDialog({ onClose }: { onClose: () => void }) {
+function AddSourceDialog({ onClose, source }: { onClose: () => void; source?: Source }) {
   const qc = useQueryClient();
   const toast = useToast();
-  const { track } = useJobs();
-  const [urls, setUrls] = useState("");
-  const [name, setName] = useState("");
-  const [hint, setHint] = useState("");
-  const [maxPages, setMaxPages] = useState(200);
+  const { track, setPanelOpen } = useJobs();
+  const [urls, setUrls] = useState(source ? source.seed_urls.join("\n") : "");
+  const [name, setName] = useState(source?.name ?? "");
+  const [hint, setHint] = useState(source?.location_hint ?? "");
+  const [maxPages, setMaxPages] = useState(source?.max_pages ?? 200);
   const list = urls.split(/\s+/).filter((u) => /^https?:\/\//.test(u));
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.updateSource(source!.id, {
+        name: name.trim() || source!.name,
+        seed_urls: list,
+        location_hint: hint.trim() || null,
+        max_pages: maxPages,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["sources"] });
+      qc.invalidateQueries({ queryKey: ["drafts"] });
+      toast.success("Website updated", "Changes apply to the next crawl. Use “Look up the address again” on a temp building to retry it with a new location.");
+      onClose();
+    },
+    onError: (e: Error) => toast.error("Couldn't save", e.message),
+  });
 
   const create = useMutation({
     mutationFn: async () => {
@@ -170,13 +239,14 @@ function AddSourceDialog({ onClose }: { onClose: () => void }) {
     onSuccess: () => {
       qc.invalidateQueries();
       toast.success("Crawl started", "Found plans will show up in the review list.");
+      setPanelOpen(true);
       onClose();
     },
     onError: (e: Error) => toast.error("Couldn't add website", e.message),
   });
 
   return (
-    <Modal title="Search a website for floor plans" onClose={onClose}>
+    <Modal title={source ? `Edit ${source.name}` : "Search a website for floor plans"} onClose={onClose}>
       <div className="space-y-4">
         <div>
           <label className="label">Start page(s)</label>
@@ -203,17 +273,47 @@ function AddSourceDialog({ onClose }: { onClose: () => void }) {
         <button className="btn-ghost" onClick={onClose}>
           Cancel
         </button>
-        <button className="btn-primary" disabled={!list.length || create.isPending} onClick={() => create.mutate()}>
-          {create.isPending && <Spinner />} Add and crawl
-        </button>
+        {source ? (
+          <button className="btn-primary" disabled={!list.length || save.isPending} onClick={() => save.mutate()}>
+            {save.isPending && <Spinner />} Save
+          </button>
+        ) : (
+          <button className="btn-primary" disabled={!list.length || create.isPending} onClick={() => create.mutate()}>
+            {create.isPending && <Spinner />} Add and crawl
+          </button>
+        )}
       </div>
     </Modal>
   );
 }
 
-function BulkApprove({ candidates }: { candidates: Candidate[] }) {
+const THUMB_KEY = "floored.reviewThumb";
+
+/** Size of the plan pictures, remembered in this browser. */
+function useThumbSize(): [number, (n: number) => void] {
+  const [size, setSize] = useState(() => {
+    try {
+      return Number(localStorage.getItem(THUMB_KEY)) || 140;
+    } catch {
+      return 140;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(THUMB_KEY, String(size));
+    } catch {
+      /* private mode */
+    }
+  }, [size]);
+  return [size, setSize];
+}
+
+/** Confirm every temp building whose location we're fairly sure of, in one go. */
+function ConfirmConfident({ drafts }: { drafts: Draft[] }) {
+  const qc = useQueryClient();
+  const toast = useToast();
   const { track } = useJobs();
-  const ready = candidates.filter((c) => c.status === "matched" && c.match_confidence >= 0.7);
+  const ready = drafts.filter((d) => draftTarget(d) && (d.building || d.suggestion?.chosen || (d.suggestion?.confidence ?? 0) >= 0.7));
   const [busy, setBusy] = useState(false);
   if (!ready.length) return null;
   return (
@@ -221,37 +321,29 @@ function BulkApprove({ candidates }: { candidates: Candidate[] }) {
       className="btn-secondary text-xs"
       disabled={busy}
       onClick={async () => {
+        if (!confirm(`Put ${ready.length} building${ready.length > 1 ? "s" : ""} on the map with all their floor plans?`)) return;
         setBusy(true);
-        for (const c of ready) {
-          const { job_id } = await api.approve(c.id);
-          track(job_id, `${c.building_name ?? "Plan"} ${c.level_label ?? ""}`.trim());
+        let floors = 0;
+        for (const d of ready) {
+          try {
+            const r = await api.confirmDraft(d.id);
+            r.job_ids.forEach((id) => track(id, `Converting ${r.building.name}`, { quiet: true }));
+            floors += r.job_ids.length;
+          } catch (e) {
+            toast.error(`Couldn't add ${d.name}`, (e as Error).message);
+          }
         }
         setBusy(false);
+        qc.invalidateQueries();
+        toast.success(`Added ${ready.length} buildings`, `Finding rooms in ${floors} floor plans. Follow along in Activity.`);
       }}
     >
-      <Wand2 className="h-3.5 w-3.5" /> Approve {ready.length} good match{ready.length > 1 ? "es" : ""}
+      {busy ? <Spinner /> : <Wand2 className="h-3.5 w-3.5" />} Confirm {ready.length} good match{ready.length > 1 ? "es" : ""}
     </button>
   );
 }
 
 function CandidateCard({ c, onZoom }: { c: Candidate; onZoom: () => void }) {
-  const qc = useQueryClient();
-  const toast = useToast();
-  const { track } = useJobs();
-  const [picking, setPicking] = useState(false);
-  const [level, setLevel] = useState(c.level_guess != null ? String(c.level_guess) : "");
-
-  const approve = useMutation({
-    mutationFn: () => api.approve(c.id, { level: level === "" ? undefined : Number(level) }),
-    onSuccess: ({ job_id }) => {
-      track(job_id, `${c.building_name ?? "Plan"} ${c.level_label ?? ""}`.trim());
-      qc.invalidateQueries({ queryKey: ["candidates"] });
-    },
-    onError: (e: Error) => toast.error("Couldn't approve", e.message),
-  });
-  const reject = useMutation({ mutationFn: () => api.reject(c.id), onSuccess: () => qc.invalidateQueries({ queryKey: ["candidates"] }) });
-  const reviewable = ["matched", "unmatched", "new", "error"].includes(c.status);
-
   return (
     <div className="card flex flex-col overflow-hidden">
       <button onClick={onZoom} className="relative block aspect-[4/3] bg-slate-50">
@@ -260,28 +352,12 @@ function CandidateCard({ c, onZoom }: { c: Candidate; onZoom: () => void }) {
           <span className="absolute left-2 top-2 rounded-md bg-slate-900/80 px-1.5 py-0.5 text-[11px] font-semibold text-white">Level {levelShort(c.level_guess)}</span>
         )}
       </button>
-      <div className="flex flex-1 flex-col gap-2 p-3">
-        <div>
-          <div className="text-[11px] uppercase tracking-wide text-slate-400">Found as</div>
-          <div className="truncate text-sm font-medium" title={c.building_guess ?? ""}>
-            {c.building_guess ?? "Unnamed"} {c.level_label && <span className="text-slate-400">· {c.level_label}</span>}
-          </div>
+      <div className="flex flex-1 flex-col gap-1 p-3">
+        <div className="truncate text-sm font-medium" title={c.building_guess ?? ""}>
+          {c.building_name ?? c.building_guess ?? "Unnamed"} {c.level_label && <span className="text-slate-400">· {c.level_label}</span>}
         </div>
-        <div>
-          <div className="text-[11px] uppercase tracking-wide text-slate-400">Matched to</div>
-          {c.building_id ? (
-            <div className="flex items-center justify-between gap-2">
-              <Link to={`/?b=${c.building_id}`} className="truncate text-sm font-medium text-indigo-600 hover:underline">
-                {c.building_name}
-              </Link>
-              <ConfidenceBar value={c.match_confidence} />
-            </div>
-          ) : (
-            <div className="text-sm text-amber-600">No building found</div>
-          )}
-          {c.match_reason && <div className="mt-0.5 line-clamp-2 text-[11px] text-slate-400">{c.match_reason}</div>}
-          {c.error && <div className="mt-0.5 line-clamp-2 text-[11px] text-rose-600">{c.error}</div>}
-        </div>
+        {c.building_id && c.match_confidence > 0 && <ConfidenceBar value={c.match_confidence} />}
+        {c.error && <div className="line-clamp-2 text-[11px] text-rose-600">{c.error}</div>}
         <div className="mt-auto flex items-center gap-2 pt-1 text-xs">
           {c.page_url && (
             <a href={c.page_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-slate-400 hover:text-slate-600">
@@ -294,140 +370,7 @@ function CandidateCard({ c, onZoom }: { c: Candidate; onZoom: () => void }) {
             </Link>
           )}
         </div>
-        {reviewable && (
-          <div className="flex items-center gap-1.5 border-t border-slate-100 pt-2">
-            <input className="input w-14 px-2 py-1 text-xs" placeholder="Lvl" title="Level" value={level} onChange={(e) => setLevel(e.target.value)} />
-            <button className="btn-ghost px-2 py-1 text-xs" onClick={() => setPicking(true)}>
-              <Search className="h-3.5 w-3.5" /> {c.building_id ? "Change" : "Choose"}
-            </button>
-            <div className="flex-1" />
-            <button className="btn-ghost px-2 py-1 text-xs text-slate-500" onClick={() => reject.mutate()} title="Not a floor plan, or not wanted">
-              <X className="h-3.5 w-3.5" />
-            </button>
-            <button className="btn-primary px-2.5 py-1 text-xs" disabled={!c.building_id || approve.isPending} onClick={() => approve.mutate()}>
-              <Check className="h-3.5 w-3.5" /> Approve
-            </button>
-          </div>
-        )}
       </div>
-      {picking && <ChooseBuildingDialog candidate={c} onClose={() => setPicking(false)} />}
     </div>
-  );
-}
-
-type Pick = { building: Building; place?: undefined } | { place: Place; building?: undefined };
-
-function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; onClose: () => void }) {
-  const qc = useQueryClient();
-  const toast = useToast();
-  const [q, setQ] = useState(candidate.building_guess ?? "");
-  const [geoQ, setGeoQ] = useState("");
-  const [pick, setPick] = useState<Pick | null>(null);
-  const hint = candidate.location_hint;
-  const buildings = useQuery({ queryKey: ["buildings"], queryFn: api.buildings });
-  const places = useQuery({ queryKey: ["geocode", geoQ, hint], queryFn: () => api.geocode(geoQ, hint), enabled: geoQ.length > 1 });
-  const filtered = useMemo(
-    () => (buildings.data ?? []).filter((b) => !q || `${b.name} ${b.address ?? ""} ${b.aliases.join(" ")}`.toLowerCase().includes(q.toLowerCase())),
-    [buildings.data, q],
-  );
-
-  const lookup = useMutation({
-    mutationFn: (target: string | Place) =>
-      typeof target === "string"
-        ? api.lookup({ name: candidate.building_guess, address: target, hint })
-        : api.lookup({ name: candidate.building_guess, address: target.display_name, lat: target.lat, lon: target.lon }),
-    onSuccess: (r) => setPick(r.building ? { building: r.building } : r.place ? { place: r.place } : null),
-    onError: (e: Error) => toast.error("Couldn't find that address", e.message),
-  });
-  const pickBuilding = useMutation({
-    mutationFn: (id: string) => api.building(id),
-    onSuccess: (b) => setPick({ building: b }),
-  });
-
-  const confirm = useMutation({
-    mutationFn: async (p: Pick) => {
-      const id = p.building ? p.building.id : (await api.createBuilding({ place: p.place, name: candidate.building_guess ?? undefined })).id;
-      return api.updateCandidate(candidate.id, { building_id: id });
-    },
-    onSuccess: () => {
-      qc.invalidateQueries();
-      onClose();
-    },
-    onError: (e: Error) => toast.error("Couldn't set building", e.message),
-  });
-
-  const where = pick?.building ?? pick?.place;
-
-  return (
-    <Modal title="Which building is this?" onClose={onClose}>
-      {candidate.address_guess && (
-        <button className="btn-secondary mb-3 w-full justify-start" disabled={lookup.isPending} onClick={() => lookup.mutate(candidate.address_guess!)}>
-          {lookup.isPending ? <Spinner /> : <MapPin className="h-4 w-4" />}
-          <span className="truncate">
-            Use the address on the page: {candidate.address_guess}
-            {hint && !candidate.address_guess.toLowerCase().includes(hint.toLowerCase()) ? ` (${hint})` : ""}
-          </span>
-        </button>
-      )}
-
-      {where && pick && (
-        <div className="mb-4 space-y-2 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3">
-          <PlacePreviewMap place={where} />
-          <div className="text-sm">
-            <div className="font-medium">{pick.building ? pick.building.name : pick.place.name || pick.place.display_name.split(",")[0]}</div>
-            <div className="text-xs text-slate-500">
-              {pick.building ? `${pick.building.address ?? ""} · already on your map` : pick.place.display_name}
-              {!where.footprint && " · no building outline, so this plan will need placing by hand"}
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <button className="btn-primary" disabled={confirm.isPending} onClick={() => confirm.mutate(pick)}>
-              {confirm.isPending && <Spinner />} Use this building
-            </button>
-            <button className="btn-ghost" onClick={() => setPick(null)}>
-              Not this one
-            </button>
-          </div>
-        </div>
-      )}
-
-      <input autoFocus className="input" placeholder="Filter your buildings" value={q} onChange={(e) => setQ(e.target.value)} />
-      <div className="mt-2 max-h-56 space-y-1 overflow-auto">
-        {filtered.map((b) => (
-          <button key={b.id} onClick={() => pickBuilding.mutate(b.id)} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
-            <span className="text-sm font-medium">{b.name}</span>
-            <span className="truncate text-xs text-slate-500">{b.address}</span>
-          </button>
-        ))}
-        {filtered.length === 0 && <div className="px-3 py-2 text-sm text-slate-500">None of your buildings match.</div>}
-      </div>
-      <div className="mt-4 border-t border-slate-100 pt-4">
-        <label className="label">Or find it on OpenStreetMap{hint ? ` (results in ${hint} first)` : ""}</label>
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            setGeoQ(q.trim());
-          }}
-        >
-          <AddressInput value={q} onChange={setQ} onPick={(p) => lookup.mutate(p)} near={{ hint }} placeholder="Start typing an address or building name" />
-          <button className="btn-secondary">Search</button>
-        </form>
-        {places.isFetching && <Spinner className="mt-2" />}
-        <div className="mt-2 space-y-1">
-          {places.data?.map((p) => (
-            <button key={`${p.osm_id}-${p.lat}`} onClick={() => setPick({ place: p })} className="flex w-full flex-col rounded-lg px-3 py-2 text-left hover:bg-slate-50">
-              <span className="text-sm font-medium">{p.name || p.display_name.split(",")[0]}</span>
-              <span className="truncate text-xs text-slate-500">{p.display_name}</span>
-            </button>
-          ))}
-          {places.data?.length === 0 && (
-            <button className="btn-secondary w-full justify-start" disabled={lookup.isPending} onClick={() => lookup.mutate(geoQ)}>
-              {lookup.isPending && <Spinner />} No exact match. Find the building at this address
-            </button>
-          )}
-        </div>
-      </div>
-    </Modal>
   );
 }

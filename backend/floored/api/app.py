@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -22,7 +23,7 @@ from ..converters import ConversionResult, available_converters
 from ..converters.base import ROOM_KINDS
 from ..db import get_session, init_db
 from ..geo import footprints, geocoder, matching
-from ..models import Building, Candidate, Floor, Job, Source
+from ..models import Building, Candidate, Draft, Floor, Job, Source
 from ..placement.fit import fit_to_footprint
 from ..placement.transform import Placement
 from ..scraper import documents
@@ -319,6 +320,62 @@ def relocate_building(building_id: str, body: RelocateIn, s: Session = DB) -> di
     return ser.building_detail(b)
 
 
+class PointIn(BaseModel):
+    lat: float
+    lon: float
+
+
+def _replace_outline(b: Building, footprint: dict[str, Any] | None) -> None:
+    b.footprint = footprint
+    for floor in b.floors:
+        if floor.conversion is not None:
+            pipeline.autoplace(floor, b)
+
+
+@app.post("/api/buildings/{building_id}/outline/add")
+def add_outline_part(building_id: str, body: PointIn, s: Session = DB) -> dict[str, Any]:
+    """Add the OSM building at a point to this building's outline (wings mapped as separate shapes)."""
+    b = _get(s, Building, building_id)
+    try:
+        found = footprints.buildings_near(body.lat, body.lon, 25)
+    except Exception as exc:
+        raise HTTPException(502, f"OpenStreetMap unavailable: {exc}") from exc
+    part = next((x for x in found if x["contains"]), None)
+    if part is None:
+        raise HTTPException(404, "There's no OpenStreetMap building outline at that spot.")
+    other = s.scalar(select(Building).where(Building.osm_id == part["osm_id"], Building.id != b.id))
+    if other is not None:
+        raise HTTPException(409, f"That outline is “{other.name}”, a separate building on your map. Remove it first to join it to this one.")
+    _replace_outline(b, footprints.combine(b.footprint, part["footprint"]))
+    if not b.osm_id:
+        b.osm_id = part["osm_id"]
+    s.flush()
+    return ser.building_detail(b)
+
+
+@app.post("/api/buildings/{building_id}/outline/remove")
+def remove_outline_part(building_id: str, body: PointIn, s: Session = DB) -> dict[str, Any]:
+    """Take the separate part of the outline at a point away."""
+    b = _get(s, Building, building_id)
+    if not b.footprint:
+        raise HTTPException(409, "This building has no outline.")
+    try:
+        _replace_outline(b, footprints.remove_part(b.footprint, body.lat, body.lon))
+    except LookupError as exc:
+        raise HTTPException(404, "Click inside one of the building's separate parts to remove it.") from exc
+    s.flush()
+    return ser.building_detail(b)
+
+
+@app.post("/api/buildings/{building_id}/spread-levels")
+def spread_levels(building_id: str, s: Session = DB) -> dict[str, Any]:
+    """Put plans that share a level onto levels of their own, so they stop overlapping."""
+    b = _get(s, Building, building_id)
+    moved = pipeline.spread_levels(b)
+    s.flush()
+    return {"moved": moved, "building": ser.building_detail(b)}
+
+
 @app.delete("/api/buildings/{building_id}", status_code=204)
 def delete_building(building_id: str, s: Session = DB) -> None:
     s.delete(_get(s, Building, building_id))
@@ -357,7 +414,7 @@ def add_floor(
     floor = pipeline.create_floor(s, b, pg.png, level=level, name=name, source_url=src)
     floor_id = floor.id
     s.commit()
-    job_id = jobs.submit("process_floor", {"floor_id": floor_id})
+    job_id = jobs.submit("process_floor", {"floor_id": floor_id}, label=f"Converting {b.name} · {floor.name}")
     s.expire_all()
     return {"floor": ser.floor_summary(_get(s, Floor, floor_id)), "job_id": job_id}
 
@@ -408,8 +465,13 @@ def level_geojson(building_id: str, level: float, s: Session = DB) -> dict[str, 
 
 @app.patch("/api/floors/{floor_id}")
 def patch_floor(floor_id: str, body: FloorPatch, s: Session = DB) -> dict[str, Any]:
+    """Rename a floor or change its level; moving onto a taken level swaps the two floors."""
     f = _get(s, Floor, floor_id)
-    for k, v in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    if changes.get("level") is not None and changes["level"] != f.level:
+        pipeline.set_floor_level(f, changes.pop("level"))
+    changes.pop("level", None)
+    for k, v in changes.items():
         setattr(f, k, v)
     pipeline.refresh_geojson(f)
     s.flush()
@@ -478,8 +540,14 @@ def copy_placement(floor_id: str, from_floor_id: str = Query(...), s: Session = 
 
 @app.post("/api/floors/{floor_id}/reprocess")
 def reprocess(floor_id: str, converter: str | None = None, keep_placement: bool = True, s: Session = DB) -> dict[str, Any]:
-    _get(s, Floor, floor_id)
-    return {"job_id": jobs.submit("process_floor", {"floor_id": floor_id, "converter": converter, "keep_placement": keep_placement})}
+    f = _get(s, Floor, floor_id)
+    return {
+        "job_id": jobs.submit(
+            "process_floor",
+            {"floor_id": floor_id, "converter": converter, "keep_placement": keep_placement},
+            label=f"Re-converting {f.building.name} · {f.name}",
+        )
+    }
 
 
 @app.patch("/api/floors/{floor_id}/rooms/{room_id}")
@@ -499,6 +567,26 @@ def patch_room(floor_id: str, room_id: str, body: RoomPatch, s: Session = DB) ->
     pipeline.refresh_geojson(f)
     s.flush()
     return ser.floor_detail(f)
+
+
+class MergeIn(BaseModel):
+    room_ids: list[str] = Field(min_length=2)
+    label: str | None = None
+    kind: Literal["room", "corridor", "stair", "elevator", "restroom", "outdoor", "unknown"] | None = None
+
+
+@app.post("/api/floors/{floor_id}/rooms/merge")
+def merge_rooms(floor_id: str, body: MergeIn, s: Session = DB) -> dict[str, Any]:
+    """Combine rooms the converter split (or that should be one) into a single room."""
+    f = _get(s, Floor, floor_id)
+    try:
+        room_id = pipeline.merge_rooms(f, body.room_ids, label=body.label, kind=body.kind)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    s.flush()
+    return {"room_id": room_id, "floor": ser.floor_detail(f)}
 
 
 @app.delete("/api/floors/{floor_id}/rooms/{room_id}")
@@ -536,7 +624,10 @@ class CandidatePatch(BaseModel):
     building_guess: str | None = None
     address_guess: str | None = None
     level_guess: float | None = None
+    level_label: str | None = None
     building_id: str | None = None
+    # Move the plan to another temp building, or "new" for one of its own.
+    draft_id: str | None = None
 
 
 @app.get("/api/sources")
@@ -555,6 +646,30 @@ def create_source(body: SourceIn, s: Session = DB) -> dict[str, Any]:
     return ser.source_out(src)
 
 
+class SourcePatch(BaseModel):
+    name: str | None = None
+    seed_urls: list[str] | None = Field(None, min_length=1)
+    allowed_domains: list[str] | None = None
+    location_hint: str | None = None
+    max_pages: int | None = Field(None, ge=1, le=5000)
+    max_depth: int | None = Field(None, ge=0, le=10)
+
+
+@app.patch("/api/sources/{source_id}")
+def patch_source(source_id: str, body: SourcePatch, s: Session = DB) -> dict[str, Any]:
+    src = _get(s, Source, source_id)
+    changes = body.model_dump(exclude_unset=True)
+    for u in changes.get("seed_urls") or []:
+        if not u.startswith(("http://", "https://")):
+            raise HTTPException(422, f"not a web address: {u}")
+    if "location_hint" in changes:
+        changes["location_hint"] = (changes["location_hint"] or "").strip() or None
+    for k, v in changes.items():
+        setattr(src, k, v)
+    s.flush()
+    return ser.source_out(src)
+
+
 @app.delete("/api/sources/{source_id}", status_code=204)
 def delete_source(source_id: str, s: Session = DB) -> None:
     s.delete(_get(s, Source, source_id))
@@ -562,8 +677,11 @@ def delete_source(source_id: str, s: Session = DB) -> None:
 
 @app.post("/api/sources/{source_id}/crawl")
 def crawl_source(source_id: str, s: Session = DB) -> dict[str, Any]:
-    _get(s, Source, source_id)
-    return {"job_id": jobs.submit("crawl", {"source_id": source_id})}
+    src = _get(s, Source, source_id)
+    for j in s.scalars(select(Job).where(Job.kind == "crawl", Job.status.in_(("queued", "running")))):
+        if (j.payload or {}).get("source_id") == source_id:
+            return {"job_id": j.id}  # already crawling it
+    return {"job_id": jobs.submit("crawl", {"source_id": source_id}, label=f"Crawling {src.name}")}
 
 
 @app.get("/api/candidates")
@@ -588,10 +706,21 @@ def list_candidates(
 @app.patch("/api/candidates/{candidate_id}")
 def patch_candidate(candidate_id: str, body: CandidatePatch, s: Session = DB) -> dict[str, Any]:
     c = _get(s, Candidate, candidate_id)
-    for k, v in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    draft_id = changes.pop("draft_id", None)
+    for k, v in changes.items():
         setattr(c, k, v)
+    if "level_guess" in changes and "level_label" not in changes:
+        c.level_label = pipeline.level_name(c.level_guess) if c.level_guess is not None else None
     if body.building_id:
         c.status, c.match_confidence, c.match_reason = "matched", 1.0, "chosen by hand"
+    if draft_id == "new":
+        pipeline.new_draft_for(s, c)
+    elif draft_id:
+        d = _get(s, Draft, draft_id)
+        c.draft_id = d.id
+        c.building_id = d.building_id or (d.suggestion or {}).get("building_id")
+        c.status = "matched" if c.building_id else "unmatched"
     s.flush()
     return ser.candidate_out(c)
 
@@ -602,8 +731,9 @@ def approve(candidate_id: str, body: ApproveIn, s: Session = DB) -> dict[str, An
     if not (body.building_id or c.building_id):
         raise HTTPException(409, "choose a building for this plan first")
     c.status = "approved"
+    label = pipeline.convert_label(c)
     s.commit()
-    return {"job_id": jobs.submit("approve_candidate", {"candidate_id": candidate_id, **body.model_dump()})}
+    return {"job_id": jobs.submit("approve_candidate", {"candidate_id": candidate_id, **body.model_dump()}, label=label)}
 
 
 @app.post("/api/candidates/{candidate_id}/reject")
@@ -619,6 +749,126 @@ def rematch(ids: list[str], s: Session = DB) -> dict[str, Any]:
     return {"job_id": jobs.submit("match_candidates", {"candidate_ids": ids})}
 
 
+# ------------------------------------------------------------------ temp buildings
+
+
+class ChoiceIn(BaseModel):
+    building_id: str | None = None
+    place: PlaceIn | None = None
+
+
+class DraftPatch(BaseModel):
+    name: str | None = None
+    address: str | None = None
+    # Where the user says it is; kept so the card remembers it before they confirm.
+    choice: ChoiceIn | None = None
+
+
+class ConfirmIn(BaseModel):
+    building_id: str | None = None
+    place: PlaceIn | None = None
+    name: str | None = None
+    address: str | None = None
+
+
+def _drafts_query(source_id: str | None = None):
+    open_ids = select(Candidate.draft_id).where(Candidate.status.in_(pipeline.REVIEWABLE), Candidate.draft_id.is_not(None))
+    q = select(Draft).where(Draft.id.in_(open_ids)).order_by(Draft.created_at, Draft.name)
+    return q.where(Draft.source_id == source_id) if source_id else q
+
+
+@app.get("/api/drafts")
+def list_drafts(source_id: str | None = None, s: Session = DB) -> list[dict[str, Any]]:
+    """Temp buildings: found plans grouped by the building they seem to show, waiting for an address."""
+    pipeline.ensure_drafts(s)
+    return [ser.draft_out(d) for d in s.scalars(_drafts_query(source_id))]
+
+
+@app.get("/api/drafts/{draft_id}")
+def get_draft(draft_id: str, s: Session = DB) -> dict[str, Any]:
+    return ser.draft_out(_get(s, Draft, draft_id))
+
+
+def _with_outline(place: dict[str, Any]) -> dict[str, Any]:
+    if not place.get("footprint"):
+        try:
+            fp = footprints.footprint_at(place["lat"], place["lon"])
+        except Exception:
+            fp = None
+        if fp and fp["contains"]:
+            place["footprint"], place["osm_id"] = fp["footprint"], fp["osm_id"]
+            place["name"] = place.get("name") or fp.get("name")
+    return place
+
+
+@app.patch("/api/drafts/{draft_id}")
+def patch_draft(draft_id: str, body: DraftPatch, s: Session = DB) -> dict[str, Any]:
+    d = _get(s, Draft, draft_id)
+    if body.name is not None and body.name.strip():
+        d.name = body.name.strip()[:300]
+    if body.address is not None:
+        d.address = body.address.strip() or None
+    if body.choice is not None:
+        if body.choice.building_id:
+            _get(s, Building, body.choice.building_id)
+            d.suggestion = {"confidence": 1.0, "reason": "chosen by you", "building_id": body.choice.building_id,
+                            "place": None, "chosen": True}
+        elif body.choice.place:
+            d.suggestion = {"confidence": 1.0, "reason": "chosen by you", "building_id": None,
+                            "place": body.choice.place.model_dump(), "chosen": True}
+        else:
+            d.suggestion = None
+        d.building_id = None if d.building_id != body.choice.building_id else d.building_id
+        d.match_state = "done"
+    s.flush()
+    return ser.draft_out(d)
+
+
+@app.post("/api/drafts/{draft_id}/confirm")
+def confirm_draft(draft_id: str, body: ConfirmIn, s: Session = DB) -> dict[str, Any]:
+    """Make the temp building real (or use one already on the map) and convert its plans."""
+    d = _get(s, Draft, draft_id)
+    sugg = d.suggestion or {}
+    building_id, place = body.building_id, body.place.model_dump() if body.place else None
+    if not (building_id or place):
+        building_id = d.building_id or sugg.get("building_id")
+        place = None if building_id else sugg.get("place")
+    if not (building_id or place):
+        raise HTTPException(409, "Say where this building is first: type its address or pick it on the map.")
+    if place:
+        place = _with_outline(dict(place))
+        if place.get("osm_id"):
+            other = s.scalar(select(Building).where(Building.osm_id == place["osm_id"]))
+            building_id, place = (other.id, None) if other else (None, place)
+    try:
+        b, ids = pipeline.confirm_draft(s, d, building_id=building_id, place=place, name=body.name, address=body.address)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    building = ser.building_summary(b)
+    s.commit()
+    job_ids = pipeline.submit_conversions(ids)
+    return {"building": building, "job_ids": job_ids}
+
+
+@app.post("/api/drafts/{draft_id}/reject")
+def reject_draft(draft_id: str, s: Session = DB) -> dict[str, Any]:
+    d = _get(s, Draft, draft_id)
+    n = 0
+    for c in d.candidates:
+        if c.status in pipeline.REVIEWABLE:
+            c.status = "rejected"
+            n += 1
+    return {"rejected": n}
+
+
+@app.post("/api/drafts/{draft_id}/rematch")
+def rematch_draft(draft_id: str, s: Session = DB) -> dict[str, Any]:
+    d = _get(s, Draft, draft_id)
+    d.match_state = "pending"
+    s.commit()
+    return {"job_id": jobs.submit("match_candidates", {"draft_ids": [draft_id]}, label=f"Finding {d.name}")}
+
+
 # ------------------------------------------------------------------ jobs & media
 
 
@@ -630,8 +880,46 @@ def list_jobs(active: bool = False, limit: int = 30, s: Session = DB) -> list[di
     return [ser.job_out(j) for j in s.scalars(q)]
 
 
+@app.get("/api/activity")
+def activity(s: Session = DB) -> dict[str, Any]:
+    """Everything the background workers are doing, waiting to do, and recently did."""
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    running = s.scalars(select(Job).where(Job.status == "running").order_by(Job.started_at)).all()
+    queued = s.scalars(select(Job).where(Job.status == "queued").order_by(Job.created_at)).all()
+    recent = s.scalars(
+        select(Job)
+        .where(Job.status.in_(("done", "failed", "cancelled")), Job.finished_at >= since)
+        .order_by(Job.finished_at.desc())
+        .limit(15)
+    ).all()
+    sources = {x.id: x.name for x in s.scalars(select(Source))}
+
+    def out(j: Job) -> dict[str, Any]:
+        label = None
+        if j.kind == "crawl" and not (j.payload or {}).get("label"):
+            label = f"Crawling {sources.get((j.payload or {}).get('source_id'), 'a website')}"
+        return ser.job_out(j, label)
+
+    return {
+        "running": [out(j) for j in running],
+        "queued": [out(j) for j in queued],
+        "recent": [out(j) for j in recent],
+        "workers": get_settings().workers,
+    }
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str, s: Session = DB) -> dict[str, Any]:
+    return ser.job_out(_get(s, Job, job_id))
+
+
+@app.post("/api/jobs/{job_id}/stop")
+def stop_job(job_id: str, s: Session = DB) -> dict[str, Any]:
+    """Stop a crawl early (what it found so far is kept) or cancel a job that hasn't started."""
+    _get(s, Job, job_id)
+    if not jobs.request_stop(job_id):
+        raise HTTPException(409, "that job has already finished")
+    s.expire_all()
     return ser.job_out(_get(s, Job, job_id))
 
 
