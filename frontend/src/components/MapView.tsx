@@ -59,13 +59,17 @@ interface Props {
   /** Height of the glass shell drawn around the floors below the viewed one (3D mode). */
   shellHeight: number;
   selectedBuildingId: string | null;
-  selectedRoomUid: string | null;
+  /** Rooms highlighted as selected (several when shift-clicking to merge). */
+  selectedRoomUids: string[];
   basemap: Basemap;
   threeD: boolean;
   hideRooms?: boolean;
   picking?: boolean;
   onSelectBuilding: (id: string | null) => void;
-  onSelectRoom: (click: RoomClick | null) => void;
+  /** ``additive``: shift was held, so add to (or take from) the selection instead of replacing it. */
+  onSelectRoom: (click: RoomClick | null, additive?: boolean) => void;
+  /** Rooms inside a shift-dragged box. */
+  onSelectRooms?: (clicks: RoomClick[]) => void;
   onHover?: (h: Hover | null) => void;
   onPick?: (lngLat: [number, number]) => void;
   onReady?: (map: MBMap) => void;
@@ -154,13 +158,74 @@ export default function MapView(props: Props) {
       const layers = ["rooms-fill", "rooms-3d", "buildings-fill", "buildings-point"].filter((l) => map.getLayer(l));
       const hits = map.queryRenderedFeatures(e.point, { layers });
       const room = hits.find((h) => h.layer?.id === "rooms-fill" || h.layer?.id === "rooms-3d");
+      const additive = e.originalEvent.shiftKey || e.originalEvent.metaKey || e.originalEvent.ctrlKey;
       if (room && !p.hideRooms) {
-        p.onSelectRoom({ feature: room as unknown as RoomClick["feature"], lngLat: [e.lngLat.lng, e.lngLat.lat] });
+        p.onSelectRoom({ feature: room as unknown as RoomClick["feature"], lngLat: [e.lngLat.lng, e.lngLat.lat] }, additive);
         return;
       }
+      if (additive) return; // a shift-click that missed shouldn't drop the selection
       const b = hits.find((h) => h.layer?.id.startsWith("buildings"));
       p.onSelectRoom(null);
       if (b) p.onSelectBuilding(String(b.properties?.id ?? b.id));
+    });
+
+    // Shift-drag draws a box that selects the rooms inside it (instead of Mapbox's box zoom).
+    map.boxZoom.disable();
+    const canvas = map.getCanvasContainer();
+    let boxStart: mapboxgl.Point | null = null;
+    let boxEl: HTMLDivElement | null = null;
+    const pos = (e: MouseEvent) => {
+      const r = canvas.getBoundingClientRect();
+      return new mapboxgl.Point(e.clientX - r.left - canvas.clientLeft, e.clientY - r.top - canvas.clientTop);
+    };
+    const onBoxMove = (e: MouseEvent) => {
+      if (!boxStart) return;
+      const cur = pos(e);
+      if (!boxEl) {
+        boxEl = document.createElement("div");
+        boxEl.className = "pointer-events-none absolute z-10 rounded-sm border-2 border-indigo-500 bg-indigo-500/10";
+        canvas.appendChild(boxEl);
+      }
+      const minX = Math.min(boxStart.x, cur.x), minY = Math.min(boxStart.y, cur.y);
+      Object.assign(boxEl.style, {
+        left: `${minX}px`,
+        top: `${minY}px`,
+        width: `${Math.abs(cur.x - boxStart.x)}px`,
+        height: `${Math.abs(cur.y - boxStart.y)}px`,
+      });
+    };
+    const onBoxUp = (e: MouseEvent) => {
+      document.removeEventListener("mousemove", onBoxMove);
+      document.removeEventListener("mouseup", onBoxUp);
+      map.dragPan.enable();
+      const start = boxStart;
+      boxStart = null;
+      if (boxEl) {
+        boxEl.remove();
+        boxEl = null;
+      } else return; // no drag: the click handler deals with it
+      const end = pos(e);
+      if (!start || Math.abs(end.x - start.x) < 4 || Math.abs(end.y - start.y) < 4) return;
+      const layers = ["rooms-fill", "rooms-3d"].filter((l) => map.getLayer(l));
+      const hits = layers.length ? map.queryRenderedFeatures([start, end], { layers }) : [];
+      const seen = new Set<string>();
+      const clicks = hits
+        .filter((h) => {
+          const id = String(h.id);
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })
+        .map((h) => ({ feature: h as unknown as RoomClick["feature"], lngLat: map.unproject(end).toArray() as [number, number] }));
+      if (clicks.length) latest.current.onSelectRooms?.(clicks);
+    };
+    canvas.addEventListener("mousedown", (e: MouseEvent) => {
+      const p = latest.current;
+      if (!e.shiftKey || e.button !== 0 || p.picking || p.hideRooms) return;
+      map.dragPan.disable();
+      boxStart = pos(e);
+      document.addEventListener("mousemove", onBoxMove);
+      document.addEventListener("mouseup", onBoxUp);
     });
 
     return () => {
@@ -236,14 +301,16 @@ export default function MapView(props: Props) {
     prevBuilding.current = props.selectedBuildingId;
   }, [styleReady, props.selectedBuildingId, props.buildings]);
 
-  const prevRoom = useRef<string | null>(null);
+  const prevRooms = useRef<string[]>([]);
+  const selectedKey = props.selectedRoomUids.join("|");
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !styleReady || !map.getSource("rooms")) return;
-    if (prevRoom.current) map.setFeatureState({ source: "rooms", id: prevRoom.current }, { selected: false });
-    if (props.selectedRoomUid) map.setFeatureState({ source: "rooms", id: props.selectedRoomUid }, { selected: true });
-    prevRoom.current = props.selectedRoomUid;
-  }, [styleReady, props.selectedRoomUid, props.rooms]);
+    for (const id of prevRooms.current) map.setFeatureState({ source: "rooms", id }, { selected: false });
+    for (const id of props.selectedRoomUids) map.setFeatureState({ source: "rooms", id }, { selected: true });
+    prevRooms.current = props.selectedRoomUids;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [styleReady, selectedKey, props.rooms]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -277,7 +344,7 @@ function addLayers(map: MBMap, fallback: boolean) {
     type: "fill",
     source: "buildings",
     ...slot("middle"),
-    filter: ["==", ["geometry-type"], "Polygon"],
+    filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
     paint: {
       "fill-color": status,
       "fill-opacity": ["case", selected, 0.04, hover, 0.4, 0.22] as never,
@@ -289,7 +356,7 @@ function addLayers(map: MBMap, fallback: boolean) {
     type: "line",
     source: "buildings",
     ...slot("middle"),
-    filter: ["==", ["geometry-type"], "Polygon"],
+    filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
     paint: {
       "line-color": status,
       "line-width": ["case", selected, 3, hover, 2.5, 1.5] as never,

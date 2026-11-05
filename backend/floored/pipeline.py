@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,7 +15,7 @@ from .config import get_settings
 from .converters import ConversionResult, get_converter
 from .db import session_scope
 from .geo import matching
-from .models import Building, Candidate, Floor, Source
+from .models import Building, Candidate, Draft, Floor, Source
 from .placement.fit import default_placement, fit_to_footprint
 from .placement.geojson import floor_geojson
 from .placement.transform import Placement
@@ -128,6 +129,64 @@ def autoplace(floor: Floor, building: Building) -> dict[str, Any]:
     return {"placement": floor.placement, "iou": None, "ambiguous": True, "alternatives": []}
 
 
+def merge_rooms(floor: Floor, room_ids: list[str], *, label: str | None = None, kind: str | None = None) -> str:
+    """Join several rooms into one (the converter split a room, or a suite should be one).
+
+    The rooms are unioned in image pixels; the wall gap between neighbours is
+    closed, and walls that end up inside the new room are dropped. Returns
+    the id of the merged room (the first one's).
+    """
+    from collections import Counter
+
+    from shapely.geometry import LineString, Polygon
+    from shapely.ops import unary_union
+
+    conv = dict(floor.conversion or {})
+    rooms = [dict(r) for r in conv.get("rooms") or []]
+    by_id = {str(r["id"]): r for r in rooms}
+    ids = list(dict.fromkeys(str(i) for i in room_ids))
+    missing = [i for i in ids if i not in by_id]
+    if missing:
+        raise LookupError(f"room {missing[0]} not found")
+    if len(ids) < 2:
+        raise ValueError("pick at least two rooms to merge")
+    picked = [by_id[i] for i in ids]
+    polys = [Polygon(r["polygon"], r.get("holes") or []).buffer(0) for r in picked]
+    w, h = conv.get("image_size") or [1000, 1000]
+    merged = unary_union(polys)
+    # Close the wall between neighbouring rooms, growing the gap we bridge until it's one shape.
+    for frac in (0.004, 0.008, 0.015, 0.03):
+        if merged.geom_type == "Polygon":
+            break
+        d = frac * max(w, h)
+        merged = unary_union(polys).buffer(d, join_style=2).buffer(-d, join_style=2)
+    if merged.geom_type != "Polygon":
+        merged = merged.convex_hull  # far apart; the user asked for one room all the same
+    merged = merged.simplify(0.5)
+
+    first = picked[0]
+    labels = [r.get("label") for r in picked if r.get("label")]
+    kinds = Counter(r.get("kind") or "unknown" for r in picked)
+    new_room = {
+        **first,
+        "polygon": [list(c) for c in merged.exterior.coords[:-1]],
+        "holes": [[list(c) for c in ring.coords[:-1]] for ring in merged.interiors],
+        "label": label if label is not None else (labels[0] if labels else None),
+        "kind": kind or kinds.most_common(1)[0][0],
+        "area_px": float(merged.area),
+        "confidence": None,
+    }
+    drop = set(ids[1:])
+    conv["rooms"] = [new_room if str(r["id"]) == ids[0] else r for r in rooms if str(r["id"]) not in drop]
+    inner = merged.buffer(-1.5)
+    conv["walls"] = [
+        line for line in conv.get("walls") or [] if len(line) < 2 or inner.is_empty or not inner.contains(LineString(line))
+    ]
+    floor.conversion = conv
+    refresh_geojson(floor)
+    return ids[0]
+
+
 def process_floor(floor_id: str, converter: str | None = None, keep_placement: bool = False) -> dict[str, Any]:
     """Run the converter on a floor's image and place the result."""
     with session_scope() as s:
@@ -157,6 +216,7 @@ def process_floor(floor_id: str, converter: str | None = None, keep_placement: b
         floor.conversion = data
         floor.converter = conv_impl.name
         floor.image_width, floor.image_height = conv.image_size
+        _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
         if keep_placement and floor.placement:
             floor.status = "placed"
             refresh_geojson(floor)
@@ -164,6 +224,30 @@ def process_floor(floor_id: str, converter: str | None = None, keep_placement: b
         else:
             fit = autoplace(floor, floor.building)
         return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": fit, "status": floor.status}
+
+
+def free_level(taken: set[float], wanted: float | None) -> float:
+    """``wanted`` if no other plan has it, else the next level above the building's top floor."""
+    if wanted is not None and float(wanted) not in taken:
+        return float(wanted)
+    if not taken:
+        return 1.0
+    return float(int(max(taken)) + 1)
+
+
+def _floor_from_plan_text(floor: Floor, info: dict[str, Any] | None) -> None:
+    """Settle a guessed level with what the plan itself says, when that level is free."""
+    if not floor.level_note or not info or info.get("level") is None:
+        return
+    if info.get("confidence", 0) < 0.5:
+        return
+    level = float(info["level"])
+    if any(f.level == level for f in floor.building.floors if f.id != floor.id):
+        floor.level_note = f"The plan says {info.get('label') or level_name(level).lower()}, but another plan has that level; check which floor this is."
+        return
+    floor.level = level
+    floor.name = info.get("label") or level_name(level)
+    floor.level_note = None
 
 
 def create_floor(
@@ -175,14 +259,20 @@ def create_floor(
     name: str | None = None,
     source_url: str | None = None,
 ) -> Floor:
-    level = 1.0 if level is None else float(level)
+    """A floor for a plan image. Two plans never share a level: a clash gets the next free one."""
     floor = None
     if source_url:
-        floor = s.scalar(
-            select(Floor).where(Floor.building_id == building.id, Floor.source_url == source_url, Floor.level == level)
-        )
+        floor = s.scalar(select(Floor).where(Floor.building_id == building.id, Floor.source_url == source_url))
     if floor is None:
-        floor = Floor(building_id=building.id, level=level, name=name or level_name(level))
+        s.flush()
+        taken = {f.level for f in s.scalars(select(Floor).where(Floor.building_id == building.id))}
+        lvl = free_level(taken, level)
+        note = None
+        if level is None:
+            note = "The plan didn't say which floor it is; check the level."
+        elif lvl != float(level):
+            note = f"Also labelled level {level_name(float(level)).lower()}, which another plan has; check which floor this is."
+        floor = Floor(building_id=building.id, level=lvl, name=(name if lvl == level else None) or level_name(lvl), level_note=note)
         s.add(floor)
     floor.image_path = storage.save_bytes(image, "plans", ".png" if image[:4] == b"\x89PNG" else ".img")
     floor.source_url = source_url
@@ -201,37 +291,240 @@ def level_name(level: float) -> str:
     return f"{n}{suffix} floor"
 
 
-# ---------------------------------------------------------------- candidates
+# ---------------------------------------------------------------- temp buildings
+
+# Candidates still waiting for a human (or a confident match).
+REVIEWABLE = ("new", "matched", "unmatched", "error")
 
 
-def match_candidate(candidate_id: str) -> None:
+def _draft_key(c: Candidate) -> str:
+    name = matching.normalize_name(c.building_guess or "")
+    if name:
+        return f"name:{name}"
+    if c.address_guess:
+        return "addr:" + re.sub(r"\W+", " ", c.address_guess.lower()).strip()
+    return f"file:{c.asset_url}"
+
+
+def _draft_name(c: Candidate) -> str:
+    name = matching.clean_name(c.building_guess)
+    if name:
+        return name[:300]
+    if c.address_guess:
+        return c.address_guess[:300]
+    if c.page_title:
+        return c.page_title[:300]
+    return c.asset_url.rstrip("/").rsplit("/", 1)[-1][:300] or "Unnamed building"
+
+
+def assign_draft(s: Session, c: Candidate) -> Draft:
+    """Put a candidate in the temp building for its name (or address, or file), making one if needed."""
+    key = _draft_key(c)
+    d = s.scalar(
+        select(Draft).where(Draft.source_id == c.source_id, Draft.key == key).order_by(Draft.created_at.desc())
+    )
+    if d is None:
+        d = Draft(source_id=c.source_id, key=key, name=_draft_name(c), address=c.address_guess)
+        s.add(d)
+        s.flush()
+    elif not d.address and c.address_guess:
+        d.address = c.address_guess
+    c.draft_id = d.id
+    if d.building_id:
+        # Plans for a building the user already confirmed go straight to it.
+        c.building_id, c.status = d.building_id, "matched"
+        c.match_confidence, c.match_reason = 0.95, "same building as plans you already confirmed"
+    return d
+
+
+def new_draft_for(s: Session, c: Candidate) -> Draft:
+    """Take a candidate out of its group into a temp building of its own."""
+    d = Draft(source_id=c.source_id, key=f"own:{c.id}", name=_draft_name(c), address=c.address_guess, match_state="done")
+    s.add(d)
+    s.flush()
+    c.draft_id, c.building_id, c.status = d.id, None, "unmatched"
+    c.match_confidence, c.match_reason = 0.0, "moved to its own building"
+    return d
+
+
+def ensure_drafts(s: Session) -> None:
+    """Group plans found before temp buildings existed."""
+    loose = s.scalars(select(Candidate).where(Candidate.draft_id.is_(None), Candidate.status.in_(REVIEWABLE))).all()
+    for c in loose:
+        building_id, conf, reason = c.building_id, c.match_confidence, c.match_reason
+        d = assign_draft(s, c)
+        if building_id and not d.suggestion and not d.building_id:
+            d.suggestion = {"confidence": conf, "reason": reason, "building_id": building_id, "place": None, "chosen": False}
+        if c.status != "new":
+            d.match_state = "done"
+    s.flush()
+
+
+def match_draft(draft_id: str) -> None:
+    """Ask the geocoder where a temp building is, and keep the answer as its suggestion."""
     with session_scope() as s:
-        c = s.get(Candidate, candidate_id)
-        hint = c.source.location_hint if c.source else None
+        d = s.get(Draft, draft_id)
+        if d is None:
+            return
+        if d.building_id or (d.suggestion or {}).get("chosen"):
+            d.match_state = "done"  # the user already said where it is
+            return
+        hint = d.source.location_hint if d.source else None
         known = known_buildings(s)
-        name, address = c.building_guess, c.address_guess
+        name, address = d.name, d.address
     try:
         m = matching.resolve(name, address, hint, known)
     except Exception as exc:  # geocoder outage etc.
-        log.warning("matching %s failed: %s", candidate_id, exc)
+        log.warning("matching draft %s failed: %s", draft_id, exc)
         m = None
     with session_scope() as s:
-        c = s.get(Candidate, candidate_id)
-        if m is None:
-            c.status = "unmatched"
-            c.match_confidence = 0
-            c.match_reason = "no building found for this name or address"
+        d = s.get(Draft, draft_id)
+        if d is None:
             return
-        if m.is_new:
-            b = building_from_place(s, m.place, name=None)
-            if name and matching.name_similarity(name, b.name) < 0.88 and name not in (b.aliases or []):
-                b.aliases = [*(b.aliases or []), name]
-            c.building_id = b.id
+        d.match_state = "done"
+        d.suggestion = (
+            None
+            if m is None
+            else {"confidence": m.confidence, "reason": m.reason, "building_id": m.building_id, "place": m.place, "chosen": False}
+        )
+        for c in d.candidates:
+            if c.status not in REVIEWABLE:
+                continue
+            c.building_id = m.building_id if m else None
+            c.status = "matched" if m else "unmatched"
+            c.match_confidence = m.confidence if m else 0.0
+            c.match_reason = m.reason if m else "no building found for this name or address"
+
+
+def confirm_draft(
+    s: Session,
+    d: Draft,
+    *,
+    building_id: str | None = None,
+    place: dict[str, Any] | None = None,
+    name: str | None = None,
+    address: str | None = None,
+    min_plan_score: float = 0.0,
+    chosen: bool = True,
+) -> tuple[Building, list[str]]:
+    """Make a temp building real (or point it at one we have) and mark its plans for conversion.
+
+    Returns the building and the ids of the candidates to convert; plans
+    scoring under ``min_plan_score`` stay in review, attached to the building.
+    """
+    if name:
+        d.name = name.strip()[:300] or d.name
+    if address:
+        d.address = address
+    if building_id:
+        b = s.get(Building, building_id)
+        if b is None:
+            raise LookupError("building not found")
+    elif place:
+        b = building_from_place(s, place, name=d.name)
+        if not b.address:
+            b.address = d.address or place.get("display_name")
+    else:
+        raise ValueError("say which building, or where it is")
+    d.building_id = b.id
+    d.match_state = "done"
+    d.suggestion = {
+        "confidence": 1.0 if chosen else (d.suggestion or {}).get("confidence", 0.9),
+        "reason": "chosen by you" if chosen else (d.suggestion or {}).get("reason", ""),
+        "building_id": b.id,
+        "place": None,
+        "chosen": chosen,
+    }
+    s.flush()
+    taken = {f.level for f in s.scalars(select(Floor).where(Floor.building_id == b.id))}
+    group = sorted(
+        (c for c in d.candidates if c.status in REVIEWABLE and c.plan_score >= min_plan_score),
+        key=lambda c: (c.level_guess is None, c.level_guess or 0, c.asset_url, c.page_index),
+    )
+    for c in group:
+        if c.floor_id:
+            continue
+        lvl = free_level(taken, c.level_guess)
+        if c.level_guess is None:
+            c.level_note = "The plan didn't say which floor it is; check the level."
+        elif lvl != c.level_guess:
+            c.level_note = (
+                f"Labelled {c.level_label or level_name(c.level_guess).lower()}, like another plan; check which floor this is."
+            )
+            c.level_label = None  # its printed label belongs to the level it can't have
+        c.level_guess = lvl
+        taken.add(lvl)
+    ids = []
+    for c in d.candidates:
+        if c.status not in REVIEWABLE:
+            continue
+        c.building_id = b.id
+        if chosen:
+            c.match_confidence, c.match_reason = 1.0, "chosen by hand"
+        if c.plan_score >= min_plan_score:
+            c.status = "approved"
+            ids.append(c.id)
         else:
-            c.building_id = m.building_id
-        c.match_confidence = m.confidence
-        c.match_reason = m.reason
-        c.status = "matched"
+            c.status = "matched"
+    s.flush()
+    return b, ids
+
+
+def convert_label(c: Candidate) -> str:
+    building = c.draft.name if c.draft else (c.building_guess or "Plan")
+    return f"Converting {building}" + (f" · {c.level_label}" if c.level_label else "")
+
+
+def submit_conversions(candidate_ids: list[str]) -> list[str]:
+    """One background job per plan, so each conversion shows in the activity list."""
+    with session_scope() as s:
+        labels = {cid: convert_label(s.get(Candidate, cid)) for cid in candidate_ids}
+    return [jobs.submit("approve_candidate", {"candidate_id": cid}, label=labels[cid]) for cid in candidate_ids]
+
+
+def match_candidate(candidate_id: str) -> None:
+    """Find the building for one plan, by way of its temp building."""
+    with session_scope() as s:
+        c = s.get(Candidate, candidate_id)
+        d = c.draft or assign_draft(s, c)
+        draft_id = d.id
+    match_draft(draft_id)
+
+
+def set_floor_level(floor: Floor, level: float) -> Floor | None:
+    """Move a floor to a level. If another plan is there, the two swap. Returns the other floor."""
+    level = float(level)
+    other = next((f for f in floor.building.floors if f.id != floor.id and f.level == level), None)
+    old = floor.level
+    if other is not None:
+        other.level = old
+        if other.name == level_name(level):
+            other.name = level_name(old)
+        other.level_note = None
+        refresh_geojson(other)
+    if floor.name == level_name(old):
+        floor.name = level_name(level)
+    floor.level = level
+    floor.level_note = None
+    refresh_geojson(floor)
+    return other
+
+
+def spread_levels(b: Building) -> int:
+    """Give every plan of a building its own level (for buildings saved before that was enforced)."""
+    taken: set[float] = set()
+    moved = 0
+    for f in sorted(b.floors, key=lambda f: (f.level, f.created_at)):
+        if f.level in taken:
+            new = free_level(taken, f.level)
+            f.level_note = f"Was on level {level_name(f.level).lower()} with another plan; check which floor this is."
+            if f.name == level_name(f.level):
+                f.name = level_name(new)
+            f.level = new
+            refresh_geojson(f)
+            moved += 1
+        taken.add(f.level)
+    return moved
 
 
 def approve_candidate(candidate_id: str, building_id: str | None = None, level: float | None = None) -> str:
@@ -253,6 +546,8 @@ def approve_candidate(candidate_id: str, building_id: str | None = None, level: 
             name=c.level_label,
             source_url=f"{c.asset_url}#page={c.page_index + 1}" if c.page_index else c.asset_url,
         )
+        if c.level_note and not floor.level_note:
+            floor.level_note = c.level_note
         c.floor_id = floor.id
         c.status = "approved"
         floor_id = floor.id
@@ -280,7 +575,20 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
         cfg = CrawlConfig(src.seed_urls, src.allowed_domains or [], src.max_pages, src.max_depth)
         skip = {c.asset_url for c in src.candidates}
     new_ids: list[str] = []
-    for found in crawl(cfg, skip_assets=skip, progress=progress):
+    draft_ids: list[str] = []
+    last: dict[str, Any] = {}
+
+    def crawl_progress(fraction: float, message: str, detail: dict[str, Any]) -> None:
+        last.clear()
+        last.update(detail)
+        progress(0.85 * fraction, message, {**detail, "buildings_found": len(draft_ids)})
+
+    from .converters import external
+
+    reader = external.read_floor if external.is_available() else None
+    for found in crawl(
+        cfg, skip_assets=skip, progress=crawl_progress, should_stop=lambda: progress.stop_requested, floor_reader=reader
+    ):
         with session_scope() as s:
             c = Candidate(
                 source_id=source_id,
@@ -298,25 +606,63 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
             )
             s.add(c)
             s.flush()
+            d = assign_draft(s, c)
             new_ids.append(c.id)
+            if d.id not in draft_ids:
+                draft_ids.append(d.id)
+    stopped = progress.stop_requested
     with session_scope() as s:
         s.get(Source, source_id).last_crawled_at = datetime.now(timezone.utc)
 
+    # One lookup per building rather than per floor; confident ones go straight on the map.
     threshold = get_settings().auto_approve_confidence
-    processed = 0
-    for i, cid in enumerate(new_ids):
-        progress(0.9 + 0.1 * i / max(len(new_ids), 1), f"Matching plan {i + 1} of {len(new_ids)} to a building")
-        match_candidate(cid)
+    to_convert: list[str] = []
+    auto_buildings = 0
+    for i, did in enumerate(draft_ids):
         with session_scope() as s:
-            c = s.get(Candidate, cid)
-            auto = c.status == "matched" and c.match_confidence >= threshold and c.plan_score >= 0.6
-        if auto:
-            try:
-                approve_candidate(cid)
-                processed += 1
-            except Exception as exc:
-                log.warning("auto-processing %s failed: %s", cid, exc)
-    return {"found": len(new_ids), "auto_processed": processed}
+            name = s.get(Draft, did).name
+        progress(
+            0.85 + 0.15 * i / len(draft_ids),
+            f"Finding building {i + 1} of {len(draft_ids)}: {name}",
+            {**last, "phase": "matching", "buildings_found": len(draft_ids), "buildings_matched": i, "current": name,
+             "current_url": None},
+        )
+        match_draft(did)
+        with session_scope() as s:
+            d = s.get(Draft, did)
+            sugg = d.suggestion or {}
+            ids: list[str] = []
+            if d.building_id:
+                ids = [c.id for c in d.candidates if c.id in new_ids and c.status in REVIEWABLE and c.plan_score >= 0.6]
+                for c in d.candidates:
+                    if c.id in ids:
+                        c.status = "approved"
+            elif sugg.get("confidence", 0) >= threshold and (sugg.get("building_id") or sugg.get("place")):
+                _, ids = confirm_draft(
+                    s, d, building_id=sugg.get("building_id"), place=sugg.get("place"), min_plan_score=0.6, chosen=False
+                )
+                auto_buildings += 1
+            to_convert += ids
+    submit_conversions(to_convert)
+
+    with session_scope() as s:
+        to_review = sum(
+            1 for did in draft_ids if any(c.status in REVIEWABLE for c in s.get(Draft, did).candidates)
+        )
+    progress(
+        1.0,
+        f"Found {len(new_ids)} plans in {len(draft_ids)} buildings",
+        {**last, "phase": "finished", "buildings_found": len(draft_ids), "buildings_matched": len(draft_ids),
+         "current": None, "current_url": None},
+    )
+    return {
+        "found": len(new_ids),
+        "buildings": len(draft_ids),
+        "auto_buildings": auto_buildings,
+        "auto_processed": len(to_convert),
+        "to_review": to_review,
+        "stopped": stopped,
+    }
 
 
 @jobs.handler("process_floor")
@@ -334,8 +680,22 @@ def _approve_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, 
 
 @jobs.handler("match_candidates")
 def _match_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, Any]:
-    ids = payload["candidate_ids"]
-    for i, cid in enumerate(ids):
-        progress(i / max(len(ids), 1), f"Matching {i + 1} of {len(ids)}")
-        match_candidate(cid)
-    return {"matched": len(ids)}
+    draft_ids = list(payload.get("draft_ids") or [])
+    with session_scope() as s:
+        for cid in payload.get("candidate_ids") or []:
+            c = s.get(Candidate, cid)
+            if c is None:
+                continue
+            d = c.draft or assign_draft(s, c)
+            if d.id not in draft_ids:
+                draft_ids.append(d.id)
+        for did in draft_ids:
+            d = s.get(Draft, did)
+            if d and d.suggestion and d.suggestion.get("chosen") and not d.building_id:
+                d.suggestion = None  # asked to look again
+            if d:
+                d.match_state = "pending"
+    for i, did in enumerate(draft_ids):
+        progress(i / max(len(draft_ids), 1), f"Finding building {i + 1} of {len(draft_ids)}")
+        match_draft(did)
+    return {"matched": len(draft_ids)}

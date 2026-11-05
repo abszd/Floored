@@ -179,3 +179,234 @@ def test_relocate_moves_floors_without_reconverting(client, monkeypatch):
     other = client.post("/api/buildings", json={"name": "Other", "place": {"lat": LAT, "lon": LON + 1}}).json()
     clash = client.post(f"/api/buildings/{other['id']}/relocate", json={"place": {"lat": c.y, "lon": c.x, "osm_id": "way/999"}})
     assert clash.status_code == 409
+
+
+def _grouping_handler():
+    # Different sizes, so the crawler doesn't drop them as duplicates of each other.
+    plans = [draw_plan(900 + 40 * i, 600 + 30 * i)[0] for i in range(4)]
+    base = _handler()
+    site = (
+        "<title>Plans</title>"
+        '<h2>Memorial Union</h2><p>800 Langdon St, Madison, WI 53706</p>'
+        '<a href="/plans/mu_floor1.png">Memorial Union First Floor</a>'
+        '<a href="/plans/mu_floor3.png">Memorial Union Third Floor</a>'
+        '<a href="/mystery/floor-plans">Mystery Hall floor plans</a>'
+    )
+    mystery_page = (
+        "<title>Mystery Hall floor plans</title><h2>Mystery Hall</h2>"
+        '<a href="/plans/mystery_floor1.png">Mystery Hall First Floor</a>'
+        '<a href="/plans/mystery_floor2.png">Mystery Hall Second Floor</a>'
+    )
+    images = dict(zip(("/plans/mu_floor1.png", "/plans/mu_floor3.png", "/plans/mystery_floor1.png",
+                       "/plans/mystery_floor2.png"), plans))
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        host, path = req.url.host, req.url.path
+        if host == "nominatim.openstreetmap.org" and "mystery" in req.url.params.get("q", "").lower():
+            return httpx.Response(200, json=[])
+        if host in ("photon.komoot.io", "overpass-api.de") or "photon" in host or "overpass" in host:
+            return httpx.Response(200, json={"features": [], "elements": []})
+        if host == "uni.example.edu" and path == "/":
+            return httpx.Response(200, html=site)
+        if host == "uni.example.edu" and path == "/mystery/floor-plans":
+            return httpx.Response(200, html=mystery_page)
+        if host == "uni.example.edu" and path in images:
+            return httpx.Response(200, content=images[path], headers={"content-type": "image/png"})
+        return base(req)
+
+    return handle
+
+
+def test_plans_grouped_into_temp_buildings(client):
+    http.set_transport(httpx.MockTransport(_grouping_handler()))
+    src = client.post(
+        "/api/sources", json={"name": "Campus", "seed_urls": ["https://uni.example.edu/"], "location_hint": "Madison, WI"}
+    ).json()
+    job_id = client.post(f"/api/sources/{src['id']}/crawl").json()["job_id"]
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["status"] == "done", job
+    assert job["label"] == "Crawling Campus"
+    assert job["detail"]["phase"] == "finished"
+    assert job["detail"]["pages_read"] >= 1 and job["detail"]["buildings_found"] == job["result"]["buildings"]
+
+    # Mystery Hall can't be found, so it waits in review as one temp building, not two
+    # loose plans, and nothing was put on the map for it.
+    drafts = client.get("/api/drafts").json()
+    mystery = [d for d in drafts if d["name"] == "Mystery Hall"]
+    assert len(mystery) == 1, [d["name"] for d in drafts]
+    d = mystery[0]
+    assert d["match_state"] == "done" and d["suggestion"] is None
+    assert sorted(c["level_guess"] for c in d["candidates"]) == [1, 2]
+    # Memorial Union was found confidently, so both its floors went straight on the map.
+    assert job["result"]["auto_buildings"] == 1 and job["result"]["to_review"] == 1
+    names = {b["name"] for b in client.get("/api/buildings").json()}
+    assert "Mystery Hall" not in names
+
+    # The user types its address once; confirming makes the building and converts every plan.
+    place = {"lat": LAT + 0.01, "lon": LON, "name": "Mystery Hall", "display_name": "1 Mystery Way", "footprint": _footprint()}
+    d = client.patch(f"/api/drafts/{d['id']}", json={"address": "1 Mystery Way", "choice": {"place": place}}).json()
+    assert d["suggestion"]["chosen"] and d["address"] == "1 Mystery Way"
+    r = client.post(f"/api/drafts/{d['id']}/confirm", json={"name": "Mystery Hall"})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["job_ids"]) == len(d["candidates"])
+    b = client.get(f"/api/buildings/{r.json()['building']['id']}").json()
+    assert b["name"] == "Mystery Hall" and len(b["floors"]) == len(d["candidates"])
+    assert all(x["name"] != "Mystery Hall" for x in client.get("/api/drafts").json())
+
+    act = client.get("/api/activity").json()
+    assert not act["running"] and not act["queued"]
+    kinds = [j["kind"] for j in act["recent"]]
+    assert "crawl" in kinds and "approve_candidate" in kinds
+    assert any(j["label"].startswith("Converting Mystery Hall") for j in act["recent"])
+
+
+def test_move_plan_to_its_own_temp_building(client):
+    from floored.db import session_scope
+    from floored.models import Candidate, Source
+
+    with session_scope() as s:
+        src = Source(name="Campus", seed_urls=["https://uni.example.edu/"], location_hint=None)
+        s.add(src)
+        s.flush()
+        for lvl in (1, 2):
+            s.add(Candidate(source_id=src.id, asset_url=f"https://x/{lvl}.png", building_guess="Old Main", level_guess=lvl,
+                            status="unmatched", plan_score=0.7))
+    drafts = client.get("/api/drafts").json()  # plans from before temp buildings get grouped
+    assert len(drafts) == 1 and len(drafts[0]["candidates"]) == 2
+    cid = drafts[0]["candidates"][1]["id"]
+    moved = client.patch(f"/api/candidates/{cid}", json={"draft_id": "new", "level_guess": 3}).json()
+    assert moved["draft_id"] != drafts[0]["id"] and moved["level_guess"] == 3
+    assert len(client.get("/api/drafts").json()) == 2
+    assert client.post(f"/api/drafts/{drafts[0]['id']}/confirm", json={}).status_code == 409  # no address yet
+    assert client.post(f"/api/drafts/{drafts[0]['id']}/reject").json()["rejected"] == 1
+    assert len(client.get("/api/drafts").json()) == 1
+
+
+def test_stop_cancels_a_queued_job(client):
+    from floored.db import session_scope
+    from floored.models import Job
+
+    with session_scope() as s:
+        j = Job(kind="crawl", payload={"source_id": "x"})
+        s.add(j)
+        s.flush()
+        job_id = j.id
+    r = client.post(f"/api/jobs/{job_id}/stop").json()
+    assert r["status"] == "cancelled"
+    assert client.post(f"/api/jobs/{job_id}/stop").status_code == 409
+    jobs._run(job_id)  # a cancelled job never runs
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "cancelled"
+
+
+def test_everything_is_editable_afterwards(client):
+    src = client.post("/api/sources", json={"name": "Campus", "seed_urls": ["https://uni.example.edu/"]}).json()
+    src = client.patch(f"/api/sources/{src['id']}", json={"name": "Main campus", "location_hint": "Madison, WI", "max_pages": 50}).json()
+    assert (src["name"], src["location_hint"], src["max_pages"]) == ("Main campus", "Madison, WI", 50)
+    assert client.patch(f"/api/sources/{src['id']}", json={"seed_urls": ["ftp://x"]}).status_code == 422
+
+    b = client.post("/api/buildings", json={"name": "Union", "place": {"lat": LAT, "lon": LON, "footprint": _footprint()}}).json()
+    png, _ = draw_plan()
+    floor_id = client.post(f"/api/buildings/{b['id']}/floors", files={"file": ("p.png", png, "image/png")}).json()["floor"]["id"]
+    floor = client.patch(f"/api/floors/{floor_id}", json={"name": "Mezzanine", "level": 1.5}).json()
+    assert floor["name"] == "Mezzanine" and floor["level"] == 1.5
+    room = next(f for f in floor["geojson"]["features"] if f["properties"]["feature"] == "room")
+    assert room["properties"]["level"] == 1.5
+    floor = client.patch(f"/api/floors/{floor_id}/rooms/{room['properties']['room_id']}", json={"label": "2310"}).json()
+    assert any(f["properties"].get("label") == "2310" for f in floor["geojson"]["features"])
+
+
+def test_merge_rooms(client):
+    b = client.post("/api/buildings", json={"name": "Union", "place": {"lat": LAT, "lon": LON, "footprint": _footprint()}}).json()
+    png, _ = draw_plan()
+    floor_id = client.post(f"/api/buildings/{b['id']}/floors", files={"file": ("p.png", png, "image/png")}).json()["floor"]["id"]
+    floor = client.get(f"/api/floors/{floor_id}").json()
+    rooms = [f for f in floor["geojson"]["features"] if f["properties"]["feature"] == "room"]
+    # Two rooms that share a wall: the pair whose outlines are closest.
+    best = min(
+        ((a, c) for i, a in enumerate(rooms) for c in rooms[i + 1:]),
+        key=lambda p: shape(p[0]["geometry"]).distance(shape(p[1]["geometry"])),
+    )
+    ids = [r["properties"]["room_id"] for r in best]
+    area = sum(r["properties"]["area_m2"] for r in best)
+    r = client.post(f"/api/floors/{floor_id}/rooms/merge", json={"room_ids": ids, "label": "Suite 200"})
+    assert r.status_code == 200, r.text
+    after = [f for f in r.json()["floor"]["geojson"]["features"] if f["properties"]["feature"] == "room"]
+    assert len(after) == len(rooms) - 1
+    merged = next(f for f in after if f["properties"]["room_id"] == ids[0])
+    assert merged["properties"]["label"] == "Suite 200"
+    assert merged["geometry"]["type"] == "Polygon"
+    assert merged["properties"]["area_m2"] >= area  # includes the wall between them
+    assert client.post(f"/api/floors/{floor_id}/rooms/merge", json={"room_ids": [ids[0], "nope"]}).status_code == 404
+
+
+def test_floors_never_share_a_level(client):
+    from floored import pipeline
+    from floored.db import session_scope
+    from floored.models import Building, Floor
+
+    b = client.post("/api/buildings", json={"name": "Union", "place": {"lat": LAT, "lon": LON, "footprint": _footprint()}}).json()
+    png, _ = draw_plan()
+    up = lambda lvl: client.post(f"/api/buildings/{b['id']}/floors", files={"file": ("p.png", png, "image/png")},
+                                 data={"level": str(lvl)}).json()["floor"]
+    first, second = up(1), up(1)
+    assert first["level"] == 1 and second["level"] == 2
+    assert second["level_note"] and not first["level_note"]
+
+    # Moving a floor onto a taken level swaps the two.
+    moved = client.patch(f"/api/floors/{second['id']}", json={"level": 1}).json()
+    assert moved["level"] == 1 and moved["level_note"] is None
+    assert client.get(f"/api/floors/{first['id']}").json()["level"] == 2
+
+    # Buildings saved before this rule can be straightened out in one go.
+    with session_scope() as s:
+        for f in s.get(Building, b["id"]).floors:
+            f.level = 0
+    detail = client.get(f"/api/buildings/{b['id']}").json()
+    assert detail["shared_levels"] == 1
+    r = client.post(f"/api/buildings/{b['id']}/spread-levels").json()
+    assert r["moved"] == 1 and r["building"]["shared_levels"] == 0
+    assert sorted(f["level"] for f in r["building"]["floors"]) == [0, 1]
+    assert pipeline.free_level({0.0, 1.0}, 1) == 2.0 and pipeline.free_level(set(), None) == 1.0
+
+
+def test_confirming_plans_with_the_same_level_keeps_them_apart(client):
+    from floored import storage
+    from floored.db import session_scope
+    from floored.models import Candidate, Source
+
+    with session_scope() as s:
+        src = Source(name="Campus", seed_urls=["https://uni.example.edu/"])
+        s.add(src)
+        s.flush()
+        for i in range(2):
+            png, _ = draw_plan(900 + 40 * i, 600)
+            s.add(Candidate(source_id=src.id, asset_url=f"https://x/{i}.png", building_guess="Old Main", level_guess=1,
+                            level_label="First Floor", status="unmatched", plan_score=0.7,
+                            image_path=storage.save_bytes(png, "candidates", ".png")))
+    d = client.get("/api/drafts").json()[0]
+    place = {"lat": LAT, "lon": LON, "name": "Old Main", "display_name": "Old Main", "footprint": _footprint()}
+    r = client.post(f"/api/drafts/{d['id']}/confirm", json={"place": place})
+    assert r.status_code == 200, r.text
+    floors = client.get(f"/api/buildings/{r.json()['building']['id']}").json()["floors"]
+    assert sorted(f["level"] for f in floors) == [1, 2]
+    assert [bool(f["level_note"]) for f in sorted(floors, key=lambda f: f["level"])] == [False, True]
+
+
+def test_guessed_level_settled_by_the_plan_text(client):
+    from floored import pipeline
+    from floored.db import session_scope
+    from floored.models import Building, Floor
+
+    b = client.post("/api/buildings", json={"name": "Union", "place": {"lat": LAT, "lon": LON}}).json()
+    png, _ = draw_plan()
+    with session_scope() as s:
+        bld = s.get(Building, b["id"])
+        first = pipeline.create_floor(s, bld, png, level=1, source_url="a")
+        guessed = pipeline.create_floor(s, bld, png, level=None, source_url="b")
+        assert guessed.level == 2 and guessed.level_note
+        pipeline._floor_from_plan_text(guessed, {"level": 1, "label": "First Floor", "confidence": 0.9})
+        assert guessed.level == 2 and "another plan" in guessed.level_note  # 1 is taken: keep it, say why
+        pipeline._floor_from_plan_text(guessed, {"level": -1, "label": "Basement", "confidence": 0.9})
+        assert (guessed.level, guessed.name, guessed.level_note) == (-1, "Basement", None)
+        pipeline._floor_from_plan_text(first, {"level": 5, "confidence": 0.9})
+        assert first.level == 1  # a level nobody guessed is left alone

@@ -35,14 +35,31 @@ _ORDINALS = {
 
 
 def parse_level(text: str) -> tuple[float, str] | None:
-    """Find a floor level in text: ("3rd Floor" -> (3, "3rd Floor"))."""
+    """Find a floor level in text: ("3rd Floor" -> (3, "3rd Floor")).
+
+    Numbers follow the floor plan converter's: ground is 0, first and main
+    floors 1, basements negative, a mezzanine half a level above its floor.
+    """
     if not text:
         return None
     t = text.replace("_", " ")
+    mezz = re.search(r"\bmezz(?:anine)?\b", t, re.I)
+    if mezz:
+        base = _parse_level(t[: mezz.start()]) or _parse_level(t[mezz.end():])
+        if base is None:
+            return 1.5, "Mezzanine"
+        return base[0] + 0.5, f"{base[1]} Mezzanine"
+    return _parse_level(t)
+
+
+def _parse_level(t: str) -> tuple[float, str] | None:
     patterns: list[tuple[str, object]] = [
         (r"\bsub-?basement\b", -2),
+        (r"\b(?:lower\s+level|ll)\s*[-#]?\s*([2-9])\b", "neg"),
         (r"\b(?:lower\s+level|basement|cellar)\b", -1),
-        (r"\b(?:ground|main|street)\s+(?:floor|level)\b", 1),
+        (r"\bground\s+(?:floor|level)\b", 0),
+        (r"\b(?:main|street|plaza|lobby|entry)\s+(?:floor|level)\b", 1),
+        (r"\bupper\s+level\b", 2),
         (r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:floor|level)\b", "ord"),
         (r"\b(\d{1,3})(?:st|nd|rd|th)\s*(?:floor|level|fl)\b", "num"),
         (r"\b(?:floor|level|flr|fl|lvl)\s*[-#:.]?\s*(\d{1,3})\b", "num"),
@@ -61,10 +78,12 @@ def parse_level(text: str) -> tuple[float, str] | None:
             return float(_ORDINALS[m.group(1).lower()]), label
         if kind == "num":
             return float(int(m.group(1))), label
+        if kind == "neg":
+            return -float(int(m.group(1))), label
         code = m.group(1).lower()
         if code.startswith("b"):
             return -float(code[1:] or 1), label
-        return (0.0 if code in ("lg", "ll") else 1.0), label
+        return {"g": 0.0, "lg": -1.0, "ll": -1.0}.get(code, 1.0), label
     return None
 
 

@@ -285,3 +285,36 @@ def test_lookup_at_a_picked_suggestion_uses_the_building_there(osm):
         # Somewhere with no building: the bare point, labelled by the address.
         bare = client.post("/api/lookup", json={"lat": 40.0, "lon": -88.0, "address": "5 Field Road, Nowhere"}).json()["place"]
         assert bare["footprint"] is None and bare["name"] == "5 Field Road"
+
+
+def test_relation_buildings_and_multi_part_outlines(osm):
+    from shapely.geometry import shape
+
+    from floored.geo import footprints
+
+    a = [(-88.5490, 47.1150), (-88.5480, 47.1150), (-88.5480, 47.1156), (-88.5490, 47.1156)]
+    b = [(-88.5470, 47.1150), (-88.5460, 47.1150), (-88.5460, 47.1156), (-88.5470, 47.1156)]
+    hole = [(-88.5488, 47.1152), (-88.5484, 47.1152), (-88.5484, 47.1154), (-88.5488, 47.1154)]
+
+    def member(ring, role):
+        pts = ring + ring[:1]
+        return {"type": "way", "role": role, "geometry": [{"lon": x, "lat": y} for x, y in pts]}
+
+    rel = {"type": "relation", "id": 77, "tags": {"building": "yes", "type": "multipolygon", "name": "Twin Halls"},
+           "members": [member(a, "outer"), member(b, "outer"), member(hole, "inner")]}
+    osm(overpass=lambda q: [rel] if "rel" in q else [])
+    found = footprints.buildings_near(47.1155, -88.5485, 60)
+    assert found and found[0]["osm_id"] == "relation/77" and found[0]["name"] == "Twin Halls"
+    g = shape(found[0]["footprint"])
+    assert g.geom_type == "MultiPolygon" and len(g.geoms) == 2
+    assert len(max(g.geoms, key=lambda p: len(p.interiors)).interiors) == 1  # the courtyard
+
+    # Wings mapped as separate ways: touching ones fuse, apart ones stay parts.
+    touching = [(-88.5480, 47.1150), (-88.5475, 47.1150), (-88.5475, 47.1156), (-88.5480, 47.1156)]
+    poly = lambda r: {"type": "Polygon", "coordinates": [[list(p) for p in r + r[:1]]]}
+    assert footprints.combine(poly(a), poly(touching))["type"] == "Polygon"
+    two = footprints.combine(poly(a), poly(b))
+    assert two["type"] == "MultiPolygon"
+    one = footprints.remove_part(two, 47.1153, -88.5465)
+    assert one["type"] == "Polygon"
+    assert footprints.remove_part(one, 47.1153, -88.5485) is None

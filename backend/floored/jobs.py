@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -16,7 +17,36 @@ from .models import Job
 
 log = logging.getLogger(__name__)
 
-Progress = Callable[[float, str], None]
+
+
+class Progress:
+    """What a job handler reports through: progress, a message, and live numbers.
+
+    ``progress(0.4, "Reading pages", {"pages_read": 12})`` updates the job;
+    ``progress.stop_requested`` says whether the user asked it to stop.
+    """
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        self._stop = False
+        self._checked = 0.0
+
+    def __call__(self, fraction: float, message: str, detail: dict[str, Any] | None = None) -> None:
+        fields: dict[str, Any] = {"progress": round(max(0.0, min(1.0, fraction)), 3), "message": message[:500]}
+        if detail is not None:
+            fields["detail"] = detail
+        _update(self.job_id, **fields)
+
+    @property
+    def stop_requested(self) -> bool:
+        if not self._stop and time.monotonic() - self._checked > 1.0:
+            self._checked = time.monotonic()
+            with session_scope() as s:
+                job = s.get(Job, self.job_id)
+                self._stop = bool(job and job.stop_requested)
+        return self._stop
+
+
 Handler = Callable[[dict[str, Any], Progress], dict[str, Any] | None]
 
 _handlers: dict[str, Handler] = {}
@@ -48,11 +78,15 @@ def recover() -> None:
             job.message = "interrupted by a server restart"
 
 
-def submit(kind: str, payload: dict[str, Any] | None = None) -> str:
+def submit(kind: str, payload: dict[str, Any] | None = None, *, label: str | None = None) -> str:
+    """Queue a job. ``label`` is what the activity list calls it ("Crawling Cal Poly")."""
     if kind not in _handlers:
         raise KeyError(f"unknown job kind {kind!r}")
+    payload = dict(payload or {})
+    if label:
+        payload["label"] = label
     with session_scope() as s:
-        job = Job(kind=kind, payload=payload or {})
+        job = Job(kind=kind, payload=payload)
         s.add(job)
         s.flush()
         job_id = job.id
@@ -61,6 +95,20 @@ def submit(kind: str, payload: dict[str, Any] | None = None) -> str:
     else:
         _pool().submit(_run, job_id)
     return job_id
+
+
+def request_stop(job_id: str) -> bool:
+    """Ask a job to stop. A queued job is cancelled; a running one stops at its next check."""
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if job is None or job.status not in ("queued", "running"):
+            return False
+        job.stop_requested = True
+        if job.status == "queued":
+            job.status = "cancelled"
+            job.message = "cancelled before it started"
+            job.finished_at = datetime.now(timezone.utc)
+        return True
 
 
 def _update(job_id: str, **fields: Any) -> None:
@@ -74,15 +122,17 @@ def _update(job_id: str, **fields: Any) -> None:
 def _run(job_id: str) -> None:
     with session_scope() as s:
         job = s.get(Job, job_id)
+        if job.status != "queued":  # cancelled while it waited
+            return
         kind, payload = job.kind, dict(job.payload or {})
-    _update(job_id, status="running", started_at=datetime.now(timezone.utc))
-
-    def progress(fraction: float, message: str) -> None:
-        _update(job_id, progress=round(max(0.0, min(1.0, fraction)), 3), message=message[:500])
+        job.status, job.started_at = "running", datetime.now(timezone.utc)
+    progress = Progress(job_id)
 
     try:
-        result = _handlers[kind](payload, progress)
-        _update(job_id, status="done", progress=1.0, result=result or {}, finished_at=datetime.now(timezone.utc))
+        # A job that was asked to stop and wound down on its own still finished:
+        # it says so in its result.
+        result = _handlers[kind](payload, progress) or {}
+        _update(job_id, status="done", progress=1.0, result=result, finished_at=datetime.now(timezone.utc))
     except Exception as exc:  # noqa: BLE001 - job failures are reported, not raised
         log.exception("job %s (%s) failed", job_id, kind)
         _update(

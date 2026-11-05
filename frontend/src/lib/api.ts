@@ -1,4 +1,6 @@
 import type {
+  Activity,
+  Draft,
   LookupResult,
   Building,
   BuildingSummary,
@@ -82,6 +84,11 @@ export const api = {
     request<Building>("/api/buildings", json("POST", body)),
   updateBuilding: (id: string, body: Partial<Pick<Building, "name" | "address" | "aliases">>) =>
     request<Building>(`/api/buildings/${id}`, json("PATCH", body)),
+  addOutlinePart: (id: string, lat: number, lon: number) =>
+    request<Building>(`/api/buildings/${id}/outline/add`, json("POST", { lat, lon })),
+  removeOutlinePart: (id: string, lat: number, lon: number) =>
+    request<Building>(`/api/buildings/${id}/outline/remove`, json("POST", { lat, lon })),
+  spreadLevels: (id: string) => request<{ moved: number; building: Building }>(`/api/buildings/${id}/spread-levels`, json("POST")),
   deleteBuilding: (id: string) => request<void>(`/api/buildings/${id}`, { method: "DELETE" }),
 
   addFloor: (buildingId: string, data: { file?: File; url?: string; level?: number; name?: string; page?: number }) => {
@@ -112,24 +119,43 @@ export const api = {
     ),
   updateRoom: (floorId: string, roomId: string, body: { label?: string | null; kind?: RoomKind }) =>
     request<Floor>(`/api/floors/${floorId}/rooms/${roomId}`, json("PATCH", body)),
+  mergeRooms: (floorId: string, body: { room_ids: string[]; label?: string | null; kind?: RoomKind }) =>
+    request<{ room_id: string; floor: Floor }>(`/api/floors/${floorId}/rooms/merge`, json("POST", body)),
   deleteRoom: (floorId: string, roomId: string) =>
     request<Floor>(`/api/floors/${floorId}/rooms/${roomId}`, { method: "DELETE" }),
 
   sources: () => request<Source[]>("/api/sources"),
   createSource: (body: Omit<Source, "id" | "last_crawled_at" | "candidate_counts">) =>
     request<Source>("/api/sources", json("POST", body)),
+  updateSource: (id: string, body: Partial<Omit<Source, "id" | "last_crawled_at" | "candidate_counts">>) =>
+    request<Source>(`/api/sources/${id}`, json("PATCH", body)),
   deleteSource: (id: string) => request<void>(`/api/sources/${id}`, { method: "DELETE" }),
   crawl: (id: string) => request<{ job_id: string }>(`/api/sources/${id}/crawl`, json("POST")),
 
   candidates: (status?: string) =>
     request<Candidate[]>(`/api/candidates${status ? `?status=${encodeURIComponent(status)}` : ""}`),
-  updateCandidate: (id: string, body: Partial<Pick<Candidate, "building_guess" | "address_guess" | "level_guess" | "building_id">>) =>
+  updateCandidate: (
+    id: string,
+    body: Partial<Pick<Candidate, "building_guess" | "address_guess" | "level_guess" | "level_label" | "building_id" | "draft_id">>,
+  ) =>
     request<Candidate>(`/api/candidates/${id}`, json("PATCH", body)),
   approve: (id: string, body: { building_id?: string; level?: number } = {}) =>
     request<{ job_id: string }>(`/api/candidates/${id}/approve`, json("POST", body)),
   reject: (id: string) => request<Candidate>(`/api/candidates/${id}/reject`, json("POST")),
   rematch: (ids: string[]) => request<{ job_id: string }>("/api/candidates/rematch", json("POST", ids)),
 
+  drafts: (sourceId?: string) => request<Draft[]>(`/api/drafts${sourceId ? `?source_id=${sourceId}` : ""}`),
+  updateDraft: (
+    id: string,
+    body: { name?: string; address?: string; choice?: { building_id?: string; place?: Place } | null },
+  ) => request<Draft>(`/api/drafts/${id}`, json("PATCH", body)),
+  confirmDraft: (id: string, body: { building_id?: string; place?: Place; name?: string; address?: string } = {}) =>
+    request<{ building: BuildingSummary; job_ids: string[] }>(`/api/drafts/${id}/confirm`, json("POST", body)),
+  rejectDraft: (id: string) => request<{ rejected: number }>(`/api/drafts/${id}/reject`, json("POST")),
+  rematchDraft: (id: string) => request<{ job_id: string }>(`/api/drafts/${id}/rematch`, json("POST")),
+
+  activity: () => request<Activity>("/api/activity"),
   jobs: (active = false) => request<Job[]>(`/api/jobs${active ? "?active=true" : ""}`),
   job: (id: string) => request<Job>(`/api/jobs/${id}`),
+  stopJob: (id: string) => request<Job>(`/api/jobs/${id}/stop`, json("POST")),
 };

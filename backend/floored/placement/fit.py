@@ -21,6 +21,7 @@ import numpy as np
 from scipy.optimize import minimize
 from shapely import affinity
 from shapely.geometry import MultiPolygon, Polygon, shape
+import shapely
 from shapely.ops import unary_union
 
 from ..converters.base import ConversionResult
@@ -111,16 +112,17 @@ def fit_to_footprint(
     outline_px = plan_outline(conv)
     if outline_px is None:
         return None
-    fp_ll = _largest(shape(footprint_geojson))
+    fp_ll = shape(footprint_geojson)
     if fp_ll.is_empty:
         return None
 
     w, h = conv.image_size
     c = fp_ll.centroid
     frame = LocalFrame(c.x, c.y)
-    fp = Polygon([frame.to_local(x, y) for x, y in fp_ll.exterior.coords])
+    # A building in several parts (wings, a relation) is fitted as a whole.
+    fp = shapely.transform(fp_ll, lambda c: np.column_stack(frame.to_local(c[:, 0], c[:, 1])))
     if not fp.is_valid:
-        fp = _largest(fp.buffer(0))
+        fp = fp.buffer(0)
 
     # Plan in "image metres before scaling": centred on the image, y up.
     plan = affinity.scale(affinity.translate(outline_px, -w / 2, -h / 2), 1, -1, origin=(0, 0))
@@ -205,7 +207,7 @@ def default_placement(
         return Placement(lon, lat, w / conv.scale_hint, h / conv.scale_hint)
     span = None
     if footprint_geojson:
-        g = _largest(shape(footprint_geojson))
+        g = shape(footprint_geojson)
         c = g.centroid
         lon, lat = c.x, c.y
         bbox = g.bounds

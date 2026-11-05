@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -43,7 +43,31 @@ def get_engine() -> Engine:
 def init_db() -> None:
     from . import models  # noqa: F401  (register tables)
 
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    _add_missing_columns(engine)
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Add columns that newer versions introduced to tables an older version created.
+
+    There is no migration tool; new tables come from ``create_all`` and new
+    columns (always nullable) from here.
+    """
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                ddl = f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col.type.compile(dialect=engine.dialect)}"
+                for fk in col.foreign_keys:
+                    ondelete = f" ON DELETE {fk.ondelete}" if fk.ondelete else ""
+                    ddl += f" REFERENCES {fk.column.table.name}({fk.column.name}){ondelete}"
+                conn.execute(text(ddl))
 
 
 def reset_engine() -> None:

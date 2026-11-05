@@ -20,8 +20,16 @@ from synth import draw_plan
         ("Basement", -1),
         ("level-2.pdf", 2),
         ("engineering_fl4.png", 4),
-        ("Ground Floor", 1),
+        ("Ground Floor", 0),
+        ("First Floor", 1),
+        ("Main Level", 1),
+        ("Upper Level", 2),
+        ("Lower Level", -1),
+        ("Lower Level 2", -2),
         ("Floor B2", -2),
+        ("2nd Floor Mezzanine", 2.5),
+        ("Mezzanine", 1.5),
+        ("Roof Plan", None),
         ("Main hall", None),
     ],
 )
@@ -198,3 +206,60 @@ def test_crawl_stays_in_the_seed_section_first(settings):
     cfg = CrawlConfig(["https://uni.example.edu/facilities/plans/"], [], max_pages=2)
     list(crawl(cfg, fetcher=Fetcher(delay_s=0)))
     assert visited == ["/facilities/plans/", "/facilities/plans/union-building"]
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+
+    from floored import config, db
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE jobs (id VARCHAR(32) PRIMARY KEY, kind VARCHAR(64), status VARCHAR(16), progress FLOAT, "
+                "message TEXT, payload JSON, result JSON, created_at DATETIME, started_at DATETIME, finished_at DATETIME)")
+    con.execute("INSERT INTO jobs (id, kind, status, progress, payload) VALUES ('a', 'crawl', 'done', 1, '{}')")
+    con.commit()
+    con.close()
+    config.override_settings(config.Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{path}"))
+    db.reset_engine()
+    try:
+        db.init_db()
+        cols = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(jobs)")}
+        assert {"detail", "stop_requested"} <= cols
+        assert "draft_id" in {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(candidates)")}
+    finally:
+        db.reset_engine()
+
+
+def test_floor_read_from_the_plan_when_the_page_does_not_say(settings):
+    png, _ = draw_plan()
+    page = (
+        '<h2>Annex</h2><a href="/plans/annex-floorplan-a.png">Annex floor plan</a>'
+        '<a href="/plans/annex-floorplan-b.png">Annex floor plan (wing)</a>'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/":
+            return httpx.Response(200, html=page)
+        if path.startswith("/plans/"):
+            # Different sizes, so neither is dropped as a duplicate of the other.
+            body = png if path.endswith("-a.png") else draw_plan(960, 640)[0]
+            return httpx.Response(200, content=body, headers={"content-type": "image/png"})
+        return httpx.Response(404)
+
+    calls = []
+
+    def reader(image: bytes):
+        calls.append(image)
+        # Sure about the first plan; only a hint for the second.
+        if len(calls) == 1:
+            return {"level": 0, "label": "Ground Floor", "confidence": 0.9, "building": "Annex Hall"}
+        return {"level": 3, "label": None, "confidence": 0.3}
+
+    http.set_transport(httpx.MockTransport(handler))
+    found = list(crawl(CrawlConfig(["https://uni.example.edu/"], []), fetcher=Fetcher(delay_s=0), floor_reader=reader))
+    assert len(found) == 2 and len(calls) == 2
+    assert (found[0].level, found[0].level_label) == (0, "Ground Floor")
+    assert found[0].building_guess  # the page's own name wins over the plan's
+    assert found[1].level is None  # a low-confidence reading is not trusted

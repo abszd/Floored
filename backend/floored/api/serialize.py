@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models import Building, Candidate, Floor, Job, Source
+from sqlalchemy.orm import object_session
+
+from ..models import Building, Candidate, Draft, Floor, Job, Source
 from ..placement.transform import Placement
 
 
@@ -18,6 +20,7 @@ def floor_summary(f: Floor) -> dict[str, Any]:
         "building_id": f.building_id,
         "name": f.name,
         "level": f.level,
+        "level_note": f.level_note,
         "status": f.status,
         "error": f.error,
         "fit_score": f.fit_score,
@@ -60,9 +63,11 @@ def building_summary(b: Building) -> dict[str, Any]:
         "osm_id": b.osm_id,
         "aliases": b.aliases or [],
         "has_footprint": b.footprint is not None,
+        "outline_parts": len(b.footprint["coordinates"]) if b.footprint and b.footprint.get("type") == "MultiPolygon" else int(b.footprint is not None),
         "floor_count": len(floors),
         "placed_count": sum(1 for f in floors if f.status == "placed"),
         "review_count": sum(1 for f in floors if f.status == "needs_review"),
+        "shared_levels": len(floors) - len({f.level for f in floors}),
     }
 
 
@@ -124,19 +129,80 @@ def candidate_out(c: Candidate) -> dict[str, Any]:
         "status": c.status,
         "floor_id": c.floor_id,
         "error": c.error,
+        "draft_id": c.draft_id,
         "created_at": c.created_at,
     }
 
 
-def job_out(j: Job) -> dict[str, Any]:
+REVIEWABLE = ("new", "matched", "unmatched", "error")
+
+
+def _with_footprint(b: Building) -> dict[str, Any]:
+    return building_detail(b)
+
+
+def draft_out(d: Draft) -> dict[str, Any]:
+    cands = sorted(
+        (c for c in d.candidates if c.status in REVIEWABLE),
+        key=lambda c: (c.level_guess is None, c.level_guess or 0, c.page_index, c.created_at),
+    )
+    sugg = None
+    if d.suggestion:
+        sugg = {k: d.suggestion.get(k) for k in ("confidence", "reason", "chosen", "place")}
+        bid = d.suggestion.get("building_id")
+        session = object_session(d)
+        osm_id = (sugg.get("place") or {}).get("osm_id")
+        if not bid and osm_id:
+            # The place has since become a building on the map (another temp building was confirmed there).
+            same = session.query(Building).filter(Building.osm_id == osm_id).first()
+            if same is not None:
+                bid, sugg["place"] = same.id, None
+        b = session.get(Building, bid) if bid else None
+        sugg["building"] = _with_footprint(b) if b else None
+        if bid and b is None and not sugg["place"]:
+            sugg = None  # the suggested building was deleted
+    out_cands = []
+    for c in cands:
+        x = candidate_out(c)
+        x["building_name"] = d.building.name if d.building else None
+        out_cands.append(x)
+    return {
+        "id": d.id,
+        "source_id": d.source_id,
+        "source_name": d.source.name if d.source else None,
+        "location_hint": d.source.location_hint if d.source else None,
+        "name": d.name,
+        "address": d.address,
+        "match_state": d.match_state,
+        "suggestion": sugg,
+        "building": _with_footprint(d.building) if d.building else None,
+        "page_urls": list(dict.fromkeys(c.page_url for c in cands if c.page_url)),
+        "candidates": out_cands,
+        "created_at": d.created_at,
+    }
+
+
+JOB_LABELS = {
+    "crawl": "Crawl",
+    "process_floor": "Converting a floor plan",
+    "approve_candidate": "Converting a floor plan",
+    "match_candidates": "Finding buildings",
+}
+
+
+def job_out(j: Job, label: str | None = None) -> dict[str, Any]:
     return {
         "id": j.id,
         "kind": j.kind,
+        "label": label or (j.payload or {}).get("label") or JOB_LABELS.get(j.kind, j.kind),
         "status": j.status,
         "progress": j.progress,
         "message": j.message,
+        "detail": j.detail or {},
+        "stop_requested": bool(j.stop_requested),
         "payload": j.payload,
         "result": {k: v for k, v in (j.result or {}).items() if k != "traceback"},
         "created_at": j.created_at,
+        "started_at": j.started_at,
         "finished_at": j.finished_at,
     }

@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ExternalLink, Image as ImageIcon, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Trash2, Layers } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ExternalLink, Image as ImageIcon, ListOrdered, Minus, Move, MoreHorizontal, Pencil, Plus, RefreshCw, Shapes, Trash2, Layers } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
 import type { Building, FloorSummary } from "../lib/types";
 import AddFloorDialog from "./AddFloorDialog";
 import EditBuildingDialog from "./EditBuildingDialog";
+import { EditFloorDialog, RoomsDialog } from "./FloorDialogs";
 import { Empty, Modal, StatusBadge } from "./ui";
 import { useToast } from "./Toast";
 
@@ -16,9 +17,11 @@ interface Props {
   onLevel: (level: number) => void;
   onBack: () => void;
   onEditPlacement: (floorId: string) => void;
+  /** Click the map to add an OSM outline to this building, or take a part away. */
+  onPickOutline: (mode: "add" | "remove") => void;
 }
 
-export default function BuildingPanel({ building, level, onLevel, onBack, onEditPlacement }: Props) {
+export default function BuildingPanel({ building, level, onLevel, onBack, onEditPlacement, onPickOutline }: Props) {
   const qc = useQueryClient();
   const toast = useToast();
   const [adding, setAdding] = useState(false);
@@ -26,6 +29,13 @@ export default function BuildingPanel({ building, level, onLevel, onBack, onEdit
   const [preview, setPreview] = useState<FloorSummary | null>(null);
   const floors = [...building.floors].sort((a, b) => b.level - a.level);
 
+  const spread = useMutation({
+    mutationFn: () => api.spreadLevels(building.id),
+    onSuccess: ({ moved }) => {
+      qc.invalidateQueries();
+      toast.success(`Moved ${moved} plan${moved === 1 ? "" : "s"} to levels of their own`, "Check the floors marked “check level”.");
+    },
+  });
   const remove = useMutation({
     mutationFn: () => api.deleteBuilding(building.id),
     onSuccess: () => {
@@ -53,6 +63,31 @@ export default function BuildingPanel({ building, level, onLevel, onBack, onEdit
         {!building.has_footprint && (
           <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
             No building outline from OpenStreetMap, so plans can't snap into place automatically. You can still place them by hand.
+          </div>
+        )}
+        <div className="mt-2 flex items-center gap-1.5 text-xs text-slate-500">
+          <Shapes className="h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1">
+            {building.has_footprint ? `Outline: ${building.outline_parts > 1 ? `${building.outline_parts} separate parts` : "one shape"}` : "No outline"}
+          </span>
+          <button className="btn-ghost px-1.5 py-0.5 text-[11px]" onClick={() => onPickOutline("add")} title="Click another OpenStreetMap shape to make it part of this building">
+            <Plus className="h-3 w-3" /> Add part
+          </button>
+          {building.outline_parts > 1 && (
+            <button className="btn-ghost px-1.5 py-0.5 text-[11px]" onClick={() => onPickOutline("remove")} title="Click a part of the outline to take it away">
+              <Minus className="h-3 w-3" /> Remove part
+            </button>
+          )}
+        </div>
+        {building.shared_levels > 0 && (
+          <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div className="flex-1">
+              {building.shared_levels} plan{building.shared_levels > 1 ? "s share a level" : " shares a level"} with another, so they overlap on the map.
+              <button className="ml-1 font-semibold underline" disabled={spread.isPending} onClick={() => spread.mutate()}>
+                Give each its own level
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -115,6 +150,8 @@ function FloorRow({
   const toast = useToast();
   const { track } = useJobs();
   const [menu, setMenu] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [rooms, setRooms] = useState(false);
   const reprocess = useMutation({
     mutationFn: () => api.reprocess(floor.id),
     onSuccess: ({ job_id }) => track(job_id, `${floor.name} conversion`),
@@ -138,8 +175,20 @@ function FloorRow({
       </div>
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium">{floor.name}</div>
-        <div className="mt-0.5 flex items-center gap-2">
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 whitespace-nowrap">
           <StatusBadge status={floor.status} />
+          {floor.level_note && (
+            <button
+              className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700"
+              title={floor.level_note}
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditing(true);
+              }}
+            >
+              Check level
+            </button>
+          )}
           {floor.room_count > 0 && <span className="text-xs text-slate-400">{floor.room_count} rooms</span>}
         </div>
         {floor.status === "error" && floor.error && <div className="mt-1 line-clamp-2 text-xs text-rose-600">{floor.error}</div>}
@@ -166,6 +215,12 @@ function FloorRow({
       </button>
       {menu && (
         <div className="panel absolute right-2 top-11 z-10 w-48 p-1 text-sm" onMouseLeave={() => setMenu(false)} onClick={(e) => e.stopPropagation()}>
+          <MenuItem icon={<Pencil className="h-4 w-4" />} onClick={() => (setMenu(false), setEditing(true))}>
+            Rename or change level
+          </MenuItem>
+          <MenuItem icon={<ListOrdered className="h-4 w-4" />} disabled={!floor.room_count} onClick={() => (setMenu(false), setRooms(true))}>
+            Edit room numbers
+          </MenuItem>
           <MenuItem icon={<Move className="h-4 w-4" />} disabled={busy || floor.status === "error"} onClick={() => (setMenu(false), onEdit())}>
             Adjust placement
           </MenuItem>
@@ -183,6 +238,16 @@ function FloorRow({
           <MenuItem icon={<Trash2 className="h-4 w-4" />} danger onClick={() => (setMenu(false), confirm(`Remove ${floor.name}?`) && remove.mutate())}>
             Remove floor
           </MenuItem>
+        </div>
+      )}
+      {editing && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <EditFloorDialog floor={floor} onClose={() => setEditing(false)} />
+        </div>
+      )}
+      {rooms && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <RoomsDialog floor={floor} onClose={() => setRooms(false)} />
         </div>
       )}
     </div>
