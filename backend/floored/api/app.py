@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -20,7 +21,7 @@ from ..config import get_settings
 from ..converters import ConversionResult, available_converters
 from ..converters.base import ROOM_KINDS
 from ..db import get_session, init_db
-from ..geo import footprints, geocoder
+from ..geo import footprints, geocoder, matching
 from ..models import Building, Candidate, Floor, Job, Source
 from ..placement.fit import fit_to_footprint
 from ..placement.transform import Placement
@@ -68,7 +69,17 @@ def geocode(q: str = Query(min_length=2)) -> list[dict[str, Any]]:
     try:
         return [p.to_dict() for p in geocoder.search(q)]
     except Exception as exc:
-        raise HTTPException(502, f"geocoder unavailable: {exc}") from exc
+        raise HTTPException(502, _geocoder_error(exc)) from exc
+
+
+def _geocoder_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (403, 429):
+        return (
+            f"OpenStreetMap's geocoder refused the request ({exc.response.status_code}). "
+            "Set FLOORED_USER_AGENT to something that identifies you, e.g. \"Floored (you@example.com)\", "
+            "restart the server, and don't run several crawls at once."
+        )
+    return f"Geocoder unavailable: {exc}"
 
 
 @app.get("/api/footprint")
@@ -156,12 +167,15 @@ def create_building(body: BuildingIn, s: Session = DB) -> dict[str, Any]:
         if not body.address:
             raise HTTPException(422, "give an address or a place")
         try:
-            results = geocoder.search(body.address, limit=3)
+            geocoder.search(body.address, limit=1)  # surfaces an outage as an outage, not "not found"
         except Exception as exc:
-            raise HTTPException(502, f"geocoder unavailable: {exc}") from exc
-        if not results:
-            raise HTTPException(404, "address not found")
-        place = results[0].to_dict()
+            raise HTTPException(502, _geocoder_error(exc)) from exc
+        m = matching.resolve(body.name, body.address, None, pipeline.known_buildings(s))
+        if m is None:
+            raise HTTPException(404, "Couldn't find that address on OpenStreetMap. Click the building on the map instead.")
+        if m.building_id:
+            return ser.building_detail(s.get(Building, m.building_id))
+        place = m.place
     if not place.get("footprint"):
         try:
             fp = footprints.footprint_at(place["lat"], place["lon"])

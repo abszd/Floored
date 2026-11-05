@@ -26,7 +26,10 @@ export default function AddBuildingDialog({
   const results = useQuery({ queryKey: ["geocode", submitted], queryFn: () => api.geocode(submitted), enabled: submitted.length > 1 });
 
   const create = useMutation({
-    mutationFn: (p: Place) => api.createBuilding({ name: name.trim() || undefined, place: p }),
+    // Without a chosen result the server looks the address up itself: it also
+    // tries simpler spellings and finds the OSM building by house number.
+    mutationFn: (p: Place | null) =>
+      api.createBuilding(p ? { name: name.trim() || undefined, place: p } : { name: name.trim() || undefined, address: submitted }),
     onSuccess: (b) => {
       qc.invalidateQueries();
       toast.success(`Added ${b.name}`);
@@ -61,7 +64,15 @@ export default function AddBuildingDialog({
           </div>
         )}
         {results.error && <div className="text-sm text-rose-600">{(results.error as Error).message}</div>}
-        {results.data?.length === 0 && <div className="text-sm text-slate-500">Nothing found. Try adding the city.</div>}
+        {results.data?.length === 0 && (
+          <div className="rounded-lg border border-dashed border-slate-300 px-3 py-3 text-sm text-slate-600">
+            <div>No exact match on OpenStreetMap.</div>
+            <button className="btn-secondary mt-2" disabled={create.isPending} onClick={() => create.mutate(null)}>
+              {create.isPending && <Spinner />} Find the building at this address
+            </button>
+            <div className="mt-2 text-xs text-slate-500">Or add the city, or click the building on the map.</div>
+          </div>
+        )}
         {results.data?.map((p) => (
           <button
             key={`${p.osm_id}-${p.lat}`}

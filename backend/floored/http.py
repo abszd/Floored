@@ -42,6 +42,8 @@ def client() -> httpx.Client:
 
 def throttle(url: str, min_interval: float) -> None:
     """Block until at least ``min_interval`` seconds have passed since the last request to this host."""
+    if _transport is not None:  # a test transport: nothing real to be polite to
+        return
     host = urlsplit(url).netloc
     while True:
         with _lock:

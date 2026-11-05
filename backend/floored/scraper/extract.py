@@ -19,6 +19,14 @@ _NAV_WORDS = re.compile(
     r"floor|plan|building|facilit|map|campus|space|room|level|architect|location|directory|hall|center", re.I
 )
 _SKIP_WORDS = re.compile(r"logo|icon|sprite|banner|avatar|social|facebook|twitter|instagram|linkedin|youtube|header|footer", re.I)
+# Words around an image that say it is a photo, not a drawing.
+_PHOTO_WORDS = re.compile(
+    r"photo|picture|\bpics?\b|portrait|headshot|selfie|gallery|slide ?show|carousel|\bhero\b|\bevents?\b|"
+    r"ceremony|celebrat|award|\bpeople\b|\bstaff\b|\bteam\b|\bnews\b|flickr|thumbnail|\bthumbs?\b|profile",
+    re.I,
+)
+# File names cameras and phones give photos.
+_CAMERA_FILE = re.compile(r"^(?:img|dsc[nf]?|pxl|gopr|mvimg|p\d{7}|photo)[_-]?\d", re.I)
 
 _ORDINALS = {
     "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
@@ -112,7 +120,10 @@ def _building_guess(title: str, heading: str, text: str) -> str | None:
         r"(download|view|click here|here|open|pdf|image|print|full size|larger|enlarge|"
         r"first|second|third|fourth|fifth|ground|lower|upper|main|north|south|east|west|\d+|[a-z])",
     )
-    for candidate in (text, heading, re.split(r"\s[|–—-]\s", title)[0]):
+    segments = re.split(r"\s[|–—:-]\s", title)
+    if len(segments) > 1:
+        segments = segments[:-1]  # "… | Michigan Tech": the last part is usually the site's name
+    for candidate in (text, heading, *segments):
         candidate = _clean(candidate)
         stripped = normalize_name(candidate)
         if stripped and len(stripped) >= 3 and not all(generic.fullmatch(w) for w in stripped.split()):
@@ -143,12 +154,20 @@ def parse_page(url: str, html: str, allowed_domains: list[str]) -> PageInfo:
         seen.add(href)
         heading = _nearest_heading(el)
         ctx = _context(el)
-        blob = " ".join([href.rsplit("/", 1)[-1], text, heading, title])
+        filename = href.rsplit("/", 1)[-1]
+        own = " ".join([filename, text, heading])
         score = 0.0
-        if _STRONG_PLAN.search(blob):
+        if _STRONG_PLAN.search(own):
             score += 0.6
-        elif _PLAN_WORDS.search(blob):
+        elif _PLAN_WORDS.search(own):
             score += 0.35
+        elif _STRONG_PLAN.search(title):
+            # A "Floor plans" page also carries photos and logos; the file has to earn the rest.
+            score += 0.3
+        elif _PLAN_WORDS.search(title):
+            score += 0.15
+        if _PHOTO_WORDS.search(f"{filename} {text}") or _CAMERA_FILE.match(filename):
+            score -= 0.4
         if kind == "pdf":
             score += 0.1
         level = parse_level(text) or parse_level(href.rsplit("/", 1)[-1]) or parse_level(heading)
@@ -161,7 +180,7 @@ def parse_page(url: str, html: str, allowed_domains: list[str]) -> PageInfo:
                 kind=kind,
                 text=text,
                 context=_clean(f"{heading} — {ctx}")[:600],
-                score=min(score, 1.0),
+                score=float(min(max(score, 0.0), 1.0)),
                 building_guess=_building_guess(title, heading, text),
                 address_guess=(local_addr or info.addresses or [None])[0],
                 level=level,
