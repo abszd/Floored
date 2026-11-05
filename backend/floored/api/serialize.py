@@ -114,6 +114,7 @@ def candidate_out(c: Candidate) -> dict[str, Any]:
         "plan_score": c.plan_score,
         "building_guess": c.building_guess,
         "address_guess": c.address_guess,
+        "location_hint": c.source.location_hint if c.source else None,
         "level_guess": c.level_guess,
         "level_label": c.level_label,
         "building_id": c.building_id,

@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import type { FloorStatus } from "../lib/types";
@@ -19,7 +20,8 @@ export function Modal({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  return (
+  // Portalled to <body> so a dialog opened from a side panel still covers the whole window.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4 backdrop-blur-sm" onMouseDown={onClose}>
       <div
         className={clsx("panel max-h-[90vh] w-full overflow-auto", wide ? "max-w-3xl" : "max-w-lg")}
@@ -33,7 +35,8 @@ export function Modal({
         </div>
         <div className="p-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -59,9 +59,29 @@ def building_from_place(s: Session, place: dict[str, Any], name: str | None = No
     return b
 
 
+def move_building(b: Building, place: dict[str, Any], *, address: str | None = None) -> None:
+    """Point a building at a new location and outline, and re-place its converted floors."""
+    footprint = place.get("footprint")
+    lat, lon = place["lat"], place["lon"]
+    if footprint:
+        from shapely.geometry import shape
+
+        c = shape(footprint).centroid
+        lon, lat = c.x, c.y
+    b.lat, b.lon = lat, lon
+    b.footprint = footprint
+    b.osm_id = place.get("osm_id")
+    b.address = address or place.get("display_name") or b.address
+    for floor in b.floors:
+        if floor.conversion is not None:
+            autoplace(floor, b)
+
+
 def known_buildings(s: Session) -> list[matching.KnownBuilding]:
     return [
-        matching.KnownBuilding(id=b.id, name=b.name, aliases=b.aliases or [], osm_id=b.osm_id, address=b.address)
+        matching.KnownBuilding(
+            id=b.id, name=b.name, aliases=b.aliases or [], osm_id=b.osm_id, address=b.address, lat=b.lat, lon=b.lon
+        )
         for b in s.scalars(select(Building))
     ]
 

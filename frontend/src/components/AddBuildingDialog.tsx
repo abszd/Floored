@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, MapPin, MousePointerClick, Search } from "lucide-react";
 import { api } from "../lib/api";
 import type { Building, Place } from "../lib/types";
+import PlacePreviewMap from "./PlacePreviewMap";
 import { Modal, Spinner } from "./ui";
 import { useToast } from "./Toast";
 
@@ -25,11 +26,24 @@ export default function AddBuildingDialog({
 
   const results = useQuery({ queryKey: ["geocode", submitted], queryFn: () => api.geocode(submitted), enabled: submitted.length > 1 });
 
+  const [existing, setExisting] = useState<Building | null>(null);
+
+  // The server's own lookup also tries simpler spellings of the address and
+  // finds the OSM building by house number; the result is previewed first.
+  const lookup = useMutation({
+    mutationFn: () => api.lookup({ address: submitted }),
+    onSuccess: (r) => {
+      setExisting(r.building);
+      if (r.place) {
+        setChosen(r.place);
+        if (!name) setName(r.place.name);
+      }
+    },
+    onError: (e: Error) => toast.error("Couldn't find that address", e.message),
+  });
+
   const create = useMutation({
-    // Without a chosen result the server looks the address up itself: it also
-    // tries simpler spellings and finds the OSM building by house number.
-    mutationFn: (p: Place | null) =>
-      api.createBuilding(p ? { name: name.trim() || undefined, place: p } : { name: name.trim() || undefined, address: submitted }),
+    mutationFn: (p: Place) => api.createBuilding({ name: name.trim() || undefined, place: p }),
     onSuccess: (b) => {
       qc.invalidateQueries();
       toast.success(`Added ${b.name}`);
@@ -46,6 +60,7 @@ export default function AddBuildingDialog({
           e.preventDefault();
           setSubmitted(q.trim());
           setChosen(null);
+          setExisting(null);
         }}
       >
         <div className="relative flex-1">
@@ -67,8 +82,8 @@ export default function AddBuildingDialog({
         {results.data?.length === 0 && (
           <div className="rounded-lg border border-dashed border-slate-300 px-3 py-3 text-sm text-slate-600">
             <div>No exact match on OpenStreetMap.</div>
-            <button className="btn-secondary mt-2" disabled={create.isPending} onClick={() => create.mutate(null)}>
-              {create.isPending && <Spinner />} Find the building at this address
+            <button className="btn-secondary mt-2" disabled={lookup.isPending} onClick={() => lookup.mutate()}>
+              {lookup.isPending && <Spinner />} Find the building at this address
             </button>
             <div className="mt-2 text-xs text-slate-500">Or add the city, or click the building on the map.</div>
           </div>
@@ -78,6 +93,7 @@ export default function AddBuildingDialog({
             key={`${p.osm_id}-${p.lat}`}
             onClick={() => {
               setChosen(p);
+              setExisting(null);
               if (!name) setName(p.name);
             }}
             className={`flex w-full items-start gap-3 rounded-lg border px-3 py-2 text-left text-sm transition ${chosen === p ? "border-indigo-400 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"}`}
@@ -92,10 +108,28 @@ export default function AddBuildingDialog({
         ))}
       </div>
 
-      {chosen && (
-        <div className="mt-4">
-          <label className="label">Name on the map</label>
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+      {existing && (
+        <div className="mt-4 space-y-2">
+          <PlacePreviewMap place={existing} />
+          <div className="text-sm text-slate-600">
+            That's <b>{existing.name}</b>, which is already on your map.{" "}
+            <button className="font-medium text-indigo-600 hover:underline" onClick={() => onCreated(existing)}>
+              Open it
+            </button>
+          </div>
+        </div>
+      )}
+      {chosen && !existing && (
+        <div className="mt-4 space-y-3">
+          <PlacePreviewMap place={chosen} />
+          <div className="text-xs text-slate-500">
+            {chosen.display_name}
+            {!chosen.footprint && " · No building outline here, so floor plans will need placing by hand."}
+          </div>
+          <div>
+            <label className="label">Name on the map</label>
+            <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
         </div>
       )}
 
@@ -104,7 +138,7 @@ export default function AddBuildingDialog({
           <MousePointerClick className="h-4 w-4" /> Click it on the map instead
         </button>
         <div className="flex-1" />
-        <button className="btn-primary" disabled={!chosen || create.isPending} onClick={() => chosen && create.mutate(chosen)}>
+        <button className="btn-primary" disabled={!chosen || !!existing || create.isPending} onClick={() => chosen && create.mutate(chosen)}>
           {create.isPending && <Spinner />} Add building
         </button>
       </div>

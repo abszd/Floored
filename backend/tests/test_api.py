@@ -143,3 +143,39 @@ def test_upload_rename_room_and_move(client):
     assert refit["fit"]["iou"] > 0.9
 
     assert client.get(f"/api/buildings/{b['id']}/levels/3.geojson").json()["features"]
+
+
+def test_relocate_moves_floors_without_reconverting(client, monkeypatch):
+    b = client.post(
+        "/api/buildings",
+        json={"name": "Union", "place": {"lat": LAT, "lon": LON, "osm_id": "way/123", "footprint": _footprint()}},
+    ).json()
+    png, _ = draw_plan()
+    floor_id = client.post(f"/api/buildings/{b['id']}/floors", files={"file": ("p.png", png, "image/png")}).json()["floor"]["id"]
+    before = client.get(f"/api/floors/{floor_id}").json()
+
+    from floored import pipeline
+
+    monkeypatch.setattr(pipeline, "get_converter", lambda *a, **k: pytest.fail("the converter ran again"))
+    shifted = shape(_footprint())
+    from shapely.affinity import translate
+
+    shifted = mapping(translate(shifted, xoff=0.5, yoff=-0.3))  # tens of km away
+    c = shape(shifted).centroid
+    r = client.post(
+        f"/api/buildings/{b['id']}/relocate",
+        json={"address": "1 New Street", "place": {"lat": c.y, "lon": c.x, "osm_id": "way/999", "footprint": shifted}},
+    )
+    assert r.status_code == 200, r.text
+    moved = r.json()
+    assert moved["address"] == "1 New Street" and moved["osm_id"] == "way/999"
+    after = client.get(f"/api/floors/{floor_id}").json()
+    assert after["placement"]["center_lon"] == pytest.approx(before["placement"]["center_lon"] + 0.5, abs=1e-4)
+    assert after["fit_score"] > 0.9
+    rooms = lambda f: sorted(x["properties"]["room_id"] for x in f["geojson"]["features"] if x["properties"]["feature"] == "room")
+    assert rooms(after) == rooms(before)
+
+    # Another building can't take the same outline.
+    other = client.post("/api/buildings", json={"name": "Other", "place": {"lat": LAT, "lon": LON + 1}}).json()
+    clash = client.post(f"/api/buildings/{other['id']}/relocate", json={"place": {"lat": c.y, "lon": c.x, "osm_id": "way/999"}})
+    assert clash.status_code == 409

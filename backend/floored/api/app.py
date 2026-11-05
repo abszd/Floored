@@ -65,11 +65,50 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/api/geocode")
-def geocode(q: str = Query(min_length=2)) -> list[dict[str, Any]]:
+def geocode(q: str = Query(min_length=2), hint: str | None = None) -> list[dict[str, Any]]:
+    """Places matching ``q``; with a ``hint`` ("Houghton, MI"), results there come first."""
     try:
-        return [p.to_dict() for p in geocoder.search(q)]
+        places = geocoder.search(q)
+        if hint and hint.lower() not in q.lower():
+            area = next(iter(geocoder.search(hint, limit=1)), None)
+            if area is not None:
+                places.sort(key=lambda p: not matching._in_area(p.lat, p.lon, area))
+        return [p.to_dict() for p in places]
     except Exception as exc:
         raise HTTPException(502, _geocoder_error(exc)) from exc
+
+
+class LookupIn(BaseModel):
+    name: str | None = None
+    address: str | None = None
+    hint: str | None = None
+    # Leave this building out of the "already have it" check (when moving it).
+    exclude_building_id: str | None = None
+
+
+@app.post("/api/lookup")
+def lookup(body: LookupIn, s: Session = DB) -> dict[str, Any]:
+    """Which building a name and/or address points to, without creating anything.
+
+    Lets the UI show the building on a map before the user commits to it.
+    """
+    if not (body.name or body.address):
+        raise HTTPException(422, "give a name or an address")
+    try:
+        geocoder.search(body.address or body.name, limit=1)  # surfaces an outage as an outage
+    except Exception as exc:
+        raise HTTPException(502, _geocoder_error(exc)) from exc
+    known = [b for b in pipeline.known_buildings(s) if b.id != body.exclude_building_id]
+    m = matching.resolve(body.name, body.address, body.hint, known)
+    if m is None:
+        raise HTTPException(404, "Couldn't find that on OpenStreetMap. Try adding the town, or click the building on the map.")
+    existing = s.get(Building, m.building_id) if m.building_id else None
+    return {
+        "confidence": m.confidence,
+        "reason": m.reason,
+        "building": ser.building_detail(existing) if existing else None,
+        "place": m.place,
+    }
 
 
 def _geocoder_error(exc: Exception) -> str:
@@ -140,6 +179,8 @@ class PlaceIn(BaseModel):
 class BuildingIn(BaseModel):
     name: str | None = None
     address: str | None = None
+    # Town or region the address is in, when the address alone may be ambiguous.
+    hint: str | None = None
     place: PlaceIn | None = None
 
 
@@ -170,7 +211,7 @@ def create_building(body: BuildingIn, s: Session = DB) -> dict[str, Any]:
             geocoder.search(body.address, limit=1)  # surfaces an outage as an outage, not "not found"
         except Exception as exc:
             raise HTTPException(502, _geocoder_error(exc)) from exc
-        m = matching.resolve(body.name, body.address, None, pipeline.known_buildings(s))
+        m = matching.resolve(body.name, body.address, body.hint, pipeline.known_buildings(s))
         if m is None:
             raise HTTPException(404, "Couldn't find that address on OpenStreetMap. Click the building on the map instead.")
         if m.building_id:
@@ -201,6 +242,36 @@ def patch_building(building_id: str, body: BuildingPatch, s: Session = DB) -> di
     b = _get(s, Building, building_id)
     for k, v in body.model_dump(exclude_unset=True).items():
         setattr(b, k, v)
+    s.flush()
+    return ser.building_detail(b)
+
+
+class RelocateIn(BaseModel):
+    place: PlaceIn
+    address: str | None = None
+
+
+@app.post("/api/buildings/{building_id}/relocate")
+def relocate_building(building_id: str, body: RelocateIn, s: Session = DB) -> dict[str, Any]:
+    """Move a building to another OSM building (usually after its address was corrected).
+
+    The rooms found in each floor plan are kept; only where they sit on the
+    map is worked out again, against the new outline.
+    """
+    b = _get(s, Building, building_id)
+    place = body.place.model_dump()
+    if place.get("osm_id"):
+        other = s.scalar(select(Building).where(Building.osm_id == place["osm_id"], Building.id != b.id))
+        if other is not None:
+            raise HTTPException(409, f"That outline already belongs to “{other.name}”. Move its floors there, or remove it first.")
+    if not place.get("footprint"):
+        try:
+            fp = footprints.footprint_at(place["lat"], place["lon"])
+        except Exception:
+            fp = None
+        if fp and fp["contains"]:
+            place["footprint"], place["osm_id"] = fp["footprint"], fp["osm_id"]
+    pipeline.move_building(b, place, address=body.address)
     s.flush()
     return ser.building_detail(b)
 

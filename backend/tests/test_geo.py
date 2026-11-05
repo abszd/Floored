@@ -195,3 +195,47 @@ def test_blocked_geocoder_explains_itself(settings):
         r = client.get("/api/geocode", params={"q": "Memorial Union"})
     assert r.status_code == 502
     assert "FLOORED_USER_AGENT" in r.json()["detail"]
+
+
+HOUGHTON = {"lat": "47.12", "lon": "-88.57", "name": "Houghton", "category": "boundary", "type": "administrative",
+            "display_name": "Houghton, Michigan", "osm_type": "relation", "osm_id": 1,
+            "boundingbox": ["47.10", "47.13", "-88.61", "-88.53"]}
+MADISON_UNION = matching.KnownBuilding(id="wi", name="Memorial Union", osm_id="way/123", lat=43.0761, lon=-89.4003)
+
+
+def _mub_overpass(q):
+    if "addr:housenumber" in q:
+        return [_way(500, MUB, building="university", name="Memorial Union Building",
+                     **{"addr:housenumber": "1400", "addr:street": "Townsend Drive"})]
+    if '"name"~"Memorial.*Union"' in q:
+        return [_way(500, MUB, building="university", name="Memorial Union Building")]
+    return []
+
+
+def test_same_name_in_another_state_is_not_a_match(osm):
+    osm(nominatim={"Houghton, MI": [HOUGHTON], "1400 Townsend Drive, Houghton, MI": [_street()]}, overpass=_mub_overpass)
+    m = matching.resolve("Memorial Union", "1400 Townsend Drive", "Houghton, MI", [MADISON_UNION])
+    assert m is not None and m.building_id is None
+    assert m.place["osm_id"] == "way/500"
+    # Without any location evidence the known building still wins.
+    assert matching.resolve("Memorial Union", None, None, [MADISON_UNION]).building_id == "wi"
+
+
+def test_results_outside_the_hinted_town_are_dropped(osm):
+    madison = {"lat": "43.0761", "lon": "-89.4003", "name": "Memorial Union", "category": "building", "type": "university",
+               "display_name": "Memorial Union, Madison, Wisconsin", "osm_type": "way", "osm_id": 123}
+    osm(nominatim={"Houghton, MI": [HOUGHTON], "Memorial Union, Houghton, MI": [madison]})
+    assert matching.resolve("Memorial Union", None, "Houghton, MI") is None
+
+
+def test_lookup_previews_without_creating(osm):
+    osm(nominatim={"Houghton, MI": [HOUGHTON], "1400 Townsend Drive, Houghton, MI": [_street()]}, overpass=_mub_overpass)
+    from floored.api.app import app
+
+    with TestClient(app) as client:
+        r = client.post("/api/lookup", json={"name": "Memorial Union", "address": "1400 Townsend Drive", "hint": "Houghton, MI"})
+        assert r.status_code == 200, r.text
+        found = r.json()
+        assert found["building"] is None
+        assert found["place"]["osm_id"] == "way/500" and found["place"]["footprint"]["type"] == "Polygon"
+        assert client.get("/api/buildings").json() == []
