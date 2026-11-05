@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Find floor plans on the web, convert them to rooms, and place them on a map."
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.110",
+    "fastapi>=0.121",  # Depends(scope=...)
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
     "sqlalchemy>=2.0",

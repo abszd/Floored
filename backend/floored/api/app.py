@@ -46,7 +46,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB = Depends(get_session)
+# scope="function" commits before the response goes out. With the default the
+# commit runs after it, so a client that creates something and immediately uses
+# it ("add website" then "crawl") could get a 404 for the thing it just made.
+DB = Depends(get_session, scope="function")
 
 
 def _get(s: Session, model: Any, id_: str) -> Any:
