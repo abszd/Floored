@@ -23,6 +23,8 @@ from .fetch import Fetcher
 MIN_TEXT_SCORE = 0.3
 # Image score a downloaded page needs to be kept.
 MIN_PLAN_SCORE = 0.45
+# Below this the converter's reading of a plan's floor is only a hint.
+READ_FLOOR_MIN_CONFIDENCE = 0.5
 # Priority taken off links that leave the seed's part of the site.
 OFF_SECTION_PENALTY = 0.4
 
@@ -72,13 +74,16 @@ def crawl(
     skip_assets: Iterable[str] = (),
     progress: Callable[[float, str, dict], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    floor_reader: Callable[[bytes], dict | None] | None = None,
 ) -> Iterator[FoundPlan]:
     """Yield floor plans as they are found.
 
     ``progress(fraction, message, detail)`` is told what the crawl is doing:
     ``detail`` has the phase ("reading" pages, then "checking" files), counts,
     and the page or file being looked at. ``should_stop()`` ends the crawl
-    early; plans already yielded stand.
+    early; plans already yielded stand. ``floor_reader(png)`` reads the
+    floor (and maybe the building) printed on a plan, for plans whose page
+    and link don't say.
     """
     fetcher = fetcher or Fetcher()
     domains = _domains(cfg)
@@ -194,6 +199,13 @@ def crawl(
             # Multi-page PDFs usually have one floor per page, named in the page text.
             level = parse_level(page.text) if page.text else None
             level = level or a.level
+            building = a.building_guess
+            if floor_reader and (level is None or not building):
+                info = floor_reader(page.png) or {}
+                if info.get("confidence", 0) >= READ_FLOOR_MIN_CONFIDENCE:
+                    if level is None and info.get("level") is not None:
+                        level = (float(info["level"]), info.get("label") or None)
+                    building = building or info.get("building")
             found += 1
             stats["plans_found"] = found
             yield FoundPlan(
@@ -204,7 +216,7 @@ def crawl(
                 context=(a.context + (" | " + page.text[:300] if page.text else ""))[:900],
                 png=page.png,
                 plan_score=round(0.5 * score + 0.5 * a.score, 3),
-                building_guess=a.building_guess,
+                building_guess=building,
                 address_guess=a.address_guess,
                 level=level[0] if level else None,
                 level_label=level[1] if level else None,

@@ -390,3 +390,23 @@ def test_confirming_plans_with_the_same_level_keeps_them_apart(client):
     floors = client.get(f"/api/buildings/{r.json()['building']['id']}").json()["floors"]
     assert sorted(f["level"] for f in floors) == [1, 2]
     assert [bool(f["level_note"]) for f in sorted(floors, key=lambda f: f["level"])] == [False, True]
+
+
+def test_guessed_level_settled_by_the_plan_text(client):
+    from floored import pipeline
+    from floored.db import session_scope
+    from floored.models import Building, Floor
+
+    b = client.post("/api/buildings", json={"name": "Union", "place": {"lat": LAT, "lon": LON}}).json()
+    png, _ = draw_plan()
+    with session_scope() as s:
+        bld = s.get(Building, b["id"])
+        first = pipeline.create_floor(s, bld, png, level=1, source_url="a")
+        guessed = pipeline.create_floor(s, bld, png, level=None, source_url="b")
+        assert guessed.level == 2 and guessed.level_note
+        pipeline._floor_from_plan_text(guessed, {"level": 1, "label": "First Floor", "confidence": 0.9})
+        assert guessed.level == 2 and "another plan" in guessed.level_note  # 1 is taken: keep it, say why
+        pipeline._floor_from_plan_text(guessed, {"level": -1, "label": "Basement", "confidence": 0.9})
+        assert (guessed.level, guessed.name, guessed.level_note) == (-1, "Basement", None)
+        pipeline._floor_from_plan_text(first, {"level": 5, "confidence": 0.9})
+        assert first.level == 1  # a level nobody guessed is left alone

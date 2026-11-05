@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,28 @@ def _import_package() -> Any:
         import floorplan_converter  # type: ignore[import-not-found]
 
         return floorplan_converter
+
+
+log = logging.getLogger(__name__)
+
+
+def read_floor(image: bytes) -> dict[str, Any] | None:
+    """Which floor a plan shows, read from its own text by the converter, if it can.
+
+    ``{"level", "label", "confidence", "text", "source", "building"?}`` or
+    ``None`` (nothing printed, or a converter without the floor reader).
+    """
+    try:
+        fn = getattr(_import_package(), "read_floor", None)
+    except Exception:
+        return None
+    if fn is None:
+        return None
+    try:
+        return fn(image)
+    except Exception as exc:  # a bad page shouldn't stop a crawl
+        log.warning("reading the floor from a plan failed: %s", exc)
+        return None
 
 
 def is_available() -> bool:

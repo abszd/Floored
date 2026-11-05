@@ -216,6 +216,7 @@ def process_floor(floor_id: str, converter: str | None = None, keep_placement: b
         floor.conversion = data
         floor.converter = conv_impl.name
         floor.image_width, floor.image_height = conv.image_size
+        _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
         if keep_placement and floor.placement:
             floor.status = "placed"
             refresh_geojson(floor)
@@ -232,6 +233,21 @@ def free_level(taken: set[float], wanted: float | None) -> float:
     if not taken:
         return 1.0
     return float(int(max(taken)) + 1)
+
+
+def _floor_from_plan_text(floor: Floor, info: dict[str, Any] | None) -> None:
+    """Settle a guessed level with what the plan itself says, when that level is free."""
+    if not floor.level_note or not info or info.get("level") is None:
+        return
+    if info.get("confidence", 0) < 0.5:
+        return
+    level = float(info["level"])
+    if any(f.level == level for f in floor.building.floors if f.id != floor.id):
+        floor.level_note = f"The plan says {info.get('label') or level_name(level).lower()}, but another plan has that level; check which floor this is."
+        return
+    floor.level = level
+    floor.name = info.get("label") or level_name(level)
+    floor.level_note = None
 
 
 def create_floor(
@@ -567,7 +583,12 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
         last.update(detail)
         progress(0.85 * fraction, message, {**detail, "buildings_found": len(draft_ids)})
 
-    for found in crawl(cfg, skip_assets=skip, progress=crawl_progress, should_stop=lambda: progress.stop_requested):
+    from .converters import external
+
+    reader = external.read_floor if external.is_available() else None
+    for found in crawl(
+        cfg, skip_assets=skip, progress=crawl_progress, should_stop=lambda: progress.stop_requested, floor_reader=reader
+    ):
         with session_scope() as s:
             c = Candidate(
                 source_id=source_id,
