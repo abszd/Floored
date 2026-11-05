@@ -8,6 +8,7 @@ from sqlalchemy.orm import object_session
 
 from ..models import Building, Candidate, Draft, Floor, Job, Source
 from ..pipeline import sheet_regions
+from ..scraper import cache
 from ..placement.transform import Placement
 
 
@@ -113,7 +114,17 @@ def source_out(src: Source) -> dict[str, Any]:
         "max_depth": src.max_depth,
         "last_crawled_at": src.last_crawled_at,
         "candidate_counts": counts,
+        # Pages and files saved by earlier crawls, for re-running without asking the site again.
+        "saved": cache.stats(_source_domains(src)),
     }
+
+
+def _source_domains(src: Source) -> list[str]:
+    from urllib.parse import urlsplit
+
+    if src.allowed_domains:
+        return list(src.allowed_domains)
+    return sorted({urlsplit(u).netloc.lower().split(":")[0] for u in src.seed_urls})
 
 
 def candidate_out(c: Candidate) -> dict[str, Any]:

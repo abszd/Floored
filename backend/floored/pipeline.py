@@ -20,6 +20,7 @@ from .placement.fit import default_placement, fit_to_footprint
 from .placement.geojson import floor_geojson
 from .placement.transform import Placement
 from .scraper.crawler import CrawlConfig, crawl
+from .scraper.fetch import Fetcher
 
 log = logging.getLogger(__name__)
 
@@ -489,6 +490,43 @@ def confirm_draft(
     return b, ids
 
 
+def reset_source(s: Session, src: Source, *, remove_from_map: bool = False) -> dict[str, int]:
+    """Forget what a website's crawls found, so the next crawl finds it all again.
+
+    Plans waiting for review (or rejected) and their temp buildings go. Plans
+    already on the map stay, and the next crawl skips them, unless
+    ``remove_from_map``: then their floors go too, and buildings left with
+    no floors at all.
+    """
+    plans = floors = buildings = 0
+    touched: set[str] = set()
+    for c in list(src.candidates):
+        on_map = c.floor_id is not None and c.status in ("approved", "processed")
+        if on_map and not remove_from_map:
+            continue
+        if c.floor_id:
+            f = s.get(Floor, c.floor_id)
+            if f is not None:
+                touched.add(f.building_id)
+                s.delete(f)
+                floors += 1
+        s.delete(c)
+        plans += 1
+    s.flush()
+    for d in list(src.drafts):
+        if not d.candidates:
+            s.delete(d)
+    s.flush()
+    for bid in touched:
+        b = s.get(Building, bid)
+        if b is not None and not b.floors:
+            s.delete(b)
+            buildings += 1
+    src.last_crawled_at = None
+    s.flush()
+    return {"plans": plans, "floors": floors, "buildings": buildings}
+
+
 def convert_label(c: Candidate) -> str:
     building = c.draft.name if c.draft else (c.building_guess or "Plan")
     return f"Converting {building}" + (f" · {c.level_label}" if c.level_label else "")
@@ -769,8 +807,15 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
     from .converters import external
 
     reader = external.read_floor if external.is_available() else None
+    # "use_saved": answer from copies an earlier crawl saved, sending the site no requests.
+    fetcher = Fetcher(use_saved=payload.get("use_saved"))
     for found in crawl(
-        cfg, skip_assets=skip, progress=crawl_progress, should_stop=lambda: progress.stop_requested, floor_reader=reader
+        cfg,
+        fetcher=fetcher,
+        skip_assets=skip,
+        progress=crawl_progress,
+        should_stop=lambda: progress.stop_requested,
+        floor_reader=reader,
     ):
         with session_scope() as s:
             c = Candidate(
@@ -845,6 +890,8 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
         "auto_processed": len(to_convert),
         "to_review": to_review,
         "stopped": stopped,
+        "from_saved": fetcher.from_saved,
+        "downloaded": fetcher.downloaded,
     }
 
 

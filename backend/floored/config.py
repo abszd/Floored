@@ -29,6 +29,9 @@ class Settings:
     # without waiting for review.
     auto_approve_confidence: float = field(default_factory=lambda: float(_env("AUTO_APPROVE", "0.85")))
     crawl_delay_s: float = field(default_factory=lambda: float(_env("CRAWL_DELAY", "1.0")))
+    # Copies of crawled pages and files: "save" keeps them so a crawl can be re-run
+    # from disk when asked, "reuse" always answers from them when it can, "off" keeps none.
+    crawl_cache: str = field(default_factory=lambda: _env("CRAWL_CACHE", "save"))
     workers: int = field(default_factory=lambda: int(_env("WORKERS", "2")))
     cors_origins: tuple[str, ...] = field(
         default_factory=lambda: tuple(o.strip() for o in _env("CORS_ORIGINS", "*").split(",") if o.strip())

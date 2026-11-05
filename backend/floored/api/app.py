@@ -858,13 +858,36 @@ def delete_source(source_id: str, s: Session = DB) -> None:
     s.delete(_get(s, Source, source_id))
 
 
+@app.delete("/api/sources/{source_id}/saved", status_code=204)
+def clear_saved(source_id: str, s: Session = DB) -> None:
+    """Delete the pages and files saved from this website, so the next crawl downloads them again."""
+    from ..scraper import cache
+
+    cache.clear(ser._source_domains(_get(s, Source, source_id)))
+
+
+class CrawlIn(BaseModel):
+    # Use pages and files saved by an earlier crawl instead of asking the site again.
+    use_saved: bool = False
+    # Start over: forget the plans earlier crawls found (see pipeline.reset_source).
+    fresh: bool = False
+    remove_from_map: bool = False
+
+
 @app.post("/api/sources/{source_id}/crawl")
-def crawl_source(source_id: str, s: Session = DB) -> dict[str, Any]:
+def crawl_source(source_id: str, body: CrawlIn | None = None, s: Session = DB) -> dict[str, Any]:
+    body = body or CrawlIn()
     src = _get(s, Source, source_id)
     for j in s.scalars(select(Job).where(Job.kind == "crawl", Job.status.in_(("queued", "running")))):
         if (j.payload or {}).get("source_id") == source_id:
+            if body.fresh:
+                raise HTTPException(409, "this website is being crawled; stop that first")
             return {"job_id": j.id}  # already crawling it
-    return {"job_id": jobs.submit("crawl", {"source_id": source_id}, label=f"Crawling {src.name}")}
+    reset = pipeline.reset_source(s, src, remove_from_map=body.remove_from_map) if body.fresh else None
+    s.commit()
+    label = f"{'Re-running' if body.fresh else 'Crawling'} {src.name}{' from saved copies' if body.use_saved else ''}"
+    job_id = jobs.submit("crawl", {"source_id": source_id, "use_saved": body.use_saved}, label=label)
+    return {"job_id": job_id, "reset": reset}
 
 
 @app.get("/api/candidates")

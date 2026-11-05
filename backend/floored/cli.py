@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     crawl.add_argument("--hint", help="location appended when geocoding, e.g. 'Madison, WI'")
     crawl.add_argument("--max-pages", type=int, default=200)
     crawl.add_argument("--depth", type=int, default=3)
+    crawl.add_argument("--use-saved", action="store_true", help="use pages and files saved by earlier crawls instead of asking the site again")
 
     conv = sub.add_parser("convert", help="run the converter on an image and print the rooms as JSON")
     conv.add_argument("image")
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             s.add(src)
             s.flush()
             source_id = src.id
-        job_id = jobs.submit("crawl", {"source_id": source_id})
+        job_id = jobs.submit("crawl", {"source_id": source_id, "use_saved": args.use_saved})
         with session_scope() as s:
             job = s.get(Job, job_id)
             print(json.dumps({"status": job.status, "message": job.message, "result": job.result}, indent=1))

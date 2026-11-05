@@ -107,6 +107,8 @@ export interface Source {
   max_depth: number;
   last_crawled_at: string | null;
   candidate_counts: Record<string, number>;
+  /** Pages and files saved by earlier crawls of this website. */
+  saved: { responses: number; bytes: number };
 }
 
 export type CandidateStatus = "new" | "matched" | "unmatched" | "approved" | "processed" | "rejected" | "error";
