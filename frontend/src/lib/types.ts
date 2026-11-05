@@ -48,6 +48,8 @@ export interface Floor extends FloorSummary {
   debug_images: Record<string, string>;
   /** The converter's guess at separate floors on this sheet. */
   sheets: SheetRegion[];
+  /** Other floors from the same file at the same size, which a crop can apply to as well. */
+  same_layout: string[];
   /** What the converter took as the building's outline, and its rooms, in image pixels. */
   outline_px: [number, number][] | null;
   rooms_px: [number, number][][];

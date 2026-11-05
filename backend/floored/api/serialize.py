@@ -52,6 +52,8 @@ def floor_detail(f: Floor) -> dict[str, Any]:
             ),
             "debug_images": {k: media_url(v) for k, v in debug.items()},
             "sheets": sheet_regions(conv),
+            # Other floors from the same file at the same size (pages of one PDF), which a crop can apply to too.
+            "same_layout": same_layout(f),
             # The converter's outline and rooms in image pixels, drawn over the plan when cropping.
             "outline_px": conv.get("outline"),
             "rooms_px": [
@@ -227,3 +229,18 @@ def job_out(j: Job, label: str | None = None) -> dict[str, Any]:
         "started_at": j.started_at,
         "finished_at": j.finished_at,
     }
+
+
+def same_layout(f: Floor) -> list[str]:
+    if not f.source_url or not f.image_width:
+        return []
+    file = f.source_url.split("#")[0]
+    return [
+        o.id
+        for o in f.building.floors
+        if o.id != f.id
+        and o.source_url
+        and o.source_url.split("#")[0] == file
+        and (o.image_width, o.image_height) == (f.image_width, f.image_height)
+        and o.conversion is not None
+    ]

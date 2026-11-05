@@ -177,3 +177,75 @@ def test_remove_an_area_of_rooms_and_walls(client):
     assert client.post(f"/api/floors/{floor['id']}/delete", json={"room_ids": ["nope"]}).status_code == 404
     back = client.post(f"/api/floors/{floor['id']}/undo").json()["floor"]
     assert len(_rooms(back)) == len(rooms)
+
+
+def test_fixes_are_logged_and_exported(client, tmp_path):
+    import json
+
+    from floored import feedback
+
+    _, floor = _upload(client, _sheet())
+    fid = floor["id"]
+    room = _rooms(floor)[0]["properties"]["room_id"]
+    client.patch(f"/api/floors/{fid}/rooms/{room}", json={"label": "101", "kind": "restroom"})
+    out = client.post(
+        f"/api/floors/{fid}/split",
+        json={"regions": [{"bbox": [0, 600, 900, 1200], "level": 1}, {"bbox": [0, 0, 900, 600], "level": 2}]},
+    ).json()
+    child = out["floors"][1]["id"]
+    p = client.get(f"/api/floors/{fid}").json()["placement"]
+    client.put(f"/api/floors/{fid}/placement", json={**p, "rotation_deg": p["rotation_deg"] + 3})
+
+    index = feedback.export(tmp_path / "fb")
+    by_id = {e["floor_id"]: e for e in index["floors"]}
+    assert set(by_id[fid]["ops"]) == {"rename", "set_kind", "split_floor", "move"}
+
+    d = tmp_path / "fb" / fid
+    machine = json.loads((d / "machine.json").read_text())
+    final = json.loads((d / "final.json").read_text())
+    # The converter's output is the whole sheet, untouched by the fixes.
+    assert machine["image_size"] == [900, 1200] and (d / "image.png").exists()
+    assert len(machine["conversion"]["rooms"]) == 7 and machine["placement"]
+    # The floor now is the bottom half of it.
+    assert final["image_size"] == [900, 600] and (d / "final.png").exists()
+    assert final["origin"] == {"floor": fid, "box": [0, 600, 900, 1200]}
+    assert final["building"]["footprint"]["type"] == "Polygon"
+    edits = [json.loads(line) for line in (d / "edits.jsonl").read_text().splitlines()]
+    assert [e["op"] for e in edits] == ["rename", "set_kind", "split_floor", "move"]
+    assert edits[0]["params"] == {"room_id": room, "before": None, "after": "101"}
+
+    # The top half had no rooms, so it was converted on its own: its machine output is its own.
+    assert by_id.get(child) is None or by_id[child]["machine_floor"] == child
+
+    # A part split off with its rooms has no machine output of its own: it points at the sheet's.
+    out = client.post(
+        f"/api/floors/{fid}/split", json={"regions": [{"bbox": [0, 0, 450, 600]}, {"bbox": [450, 0, 900, 600]}]}
+    ).json()
+    right = out["floors"][1]["id"]
+    index = feedback.export(tmp_path / "fb2")
+    entry = next(e for e in index["floors"] if e["floor_id"] == right)
+    assert entry["machine_floor"] == fid
+    final = json.loads((tmp_path / "fb2" / right / "final.json").read_text())
+    assert final["origin"] == {"floor": fid, "box": [450, 600, 900, 1200]}
+    left = json.loads((tmp_path / "fb2" / fid / "final.json").read_text())
+    assert left["origin"]["box"] == [0, 600, 450, 1200]
+
+
+def test_crop_other_pages_of_the_same_file_alike(client):
+    from floored.db import session_scope
+    from floored.models import Floor
+
+    b, first = _upload(client, _sheet(title_block=True))
+    second = client.post(
+        f"/api/buildings/{b['id']}/floors", files={"file": ("p.png", _sheet(title_block=True), "image/png")}, data={"level": "2"}
+    ).json()["floor"]
+    with session_scope() as s:
+        s.get(Floor, first["id"]).source_url = "https://x.edu/plans.pdf"
+        s.get(Floor, second["id"]).source_url = "https://x.edu/plans.pdf#page=2"
+    assert client.get(f"/api/floors/{first['id']}").json()["same_layout"] == [second["id"]]
+    r = client.post(
+        f"/api/floors/{first['id']}/split", json={"regions": [{"bbox": [0, 0, 900, 600]}], "also": [second["id"]]}
+    ).json()
+    assert r["also_cropped"] == [second["id"]]
+    assert client.get(f"/api/floors/{second['id']}").json()["image_size"] == [900, 600]
+    assert client.get(f"/api/floors/{second['id']}").json()["undo"] == "Crop like another page"

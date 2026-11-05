@@ -15,7 +15,7 @@ from .config import get_settings
 from .converters import ConversionResult, get_converter
 from .db import session_scope
 from .geo import matching
-from .models import Building, Candidate, Draft, Floor, Source
+from .models import Building, Candidate, Correction, Draft, Floor, Source
 from .placement.fit import default_placement, fit_to_footprint
 from .placement.geojson import floor_geojson
 from .placement.transform import Placement
@@ -229,13 +229,21 @@ def process_floor(
             _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             floor.status = "placed"
             refresh_geojson(floor)
+            remember_machine(floor, None)
             return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": None, "status": floor.status}
+        # The machine's own output, before it is split or placed.
+        whole = {"conversion": floor.conversion, "image_path": floor.image_path, "image_size": [floor.image_width, floor.image_height]}
         parts = auto_split(s, floor) if split else []
         if not parts:
             _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             fit = autoplace(floor, floor.building)
+            remember_machine(floor, fit)
             return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": fit, "status": floor.status}
         # Parts of the sheet the converter found no rooms in are converted on their own.
+        for f in parts:
+            remember_machine(f, {"iou": f.fit_score})
+            # Each part's machine output is the whole sheet's; final.json says which box it is.
+            f.machine = {**f.machine, **whole, "auto_split": True}
         empty = [(f.id, f"Converting {f.building.name} · {f.name}") for f in parts if not (f.conversion or {}).get("rooms")]
         for f in parts:
             if f.id in dict(empty):
@@ -586,6 +594,32 @@ def spread_levels(b: Building) -> int:
 
 # ---------------------------------------------------------------- editing
 
+
+def log_fix(s: Session, floor: Floor | None, op: str, *, building_id: str | None = None, **params: Any) -> None:
+    """Note a fix a person made, so the converter and matching can learn from it (see floored.feedback)."""
+    s.add(
+        Correction(
+            floor_id=floor.id if floor is not None else None,
+            building_id=building_id or (floor.building_id if floor is not None else None),
+            op=op,
+            params=params,
+        )
+    )
+
+
+def remember_machine(floor: Floor, fit: dict[str, Any] | None) -> None:
+    """Keep what the converter and the fit produced, untouched by later edits."""
+    floor.machine = {
+        "conversion": floor.conversion,
+        "placement": floor.placement,
+        "fit_iou": (fit or {}).get("iou"),
+        "ambiguous": (fit or {}).get("ambiguous"),
+        "converter": floor.converter,
+        "image_path": floor.image_path,
+        "image_size": [floor.image_width, floor.image_height],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
 HISTORY_LIMIT = 12
 _SNAP_FIELDS = ("conversion", "placement", "status", "fit_score", "image_path", "image_width", "image_height", "level", "name", "level_note")
 
@@ -668,6 +702,10 @@ def split_floor(
     anchor: Placement | None = None
     for i, (r, bx) in enumerate(zip(regions, boxes)):
         sub = editing.crop_conversion(conv, bx)
+        # Where this part sits in the image the converter saw, so fixes can be compared with its output.
+        org = (conv.get("meta") or {}).get("origin") or {"floor": floor.id, "box": [0, 0, w, h]}
+        ox, oy = org["box"][0], org["box"][1]
+        sub["meta"]["origin"] = {"floor": org["floor"], "box": [ox + bx[0], oy + bx[1], ox + bx[2], oy + bx[3]]}
         ring = r.get("outline")
         if ring and len(ring) >= 3:
             sub["outline"] = [[float(x) - bx[0], float(y) - bx[1]] for x, y in ring]

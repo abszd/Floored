@@ -131,8 +131,8 @@ export const api = {
     request<{ room_ids: string[]; floor: Floor }>(`/api/floors/${floorId}/rooms/${roomId}/split`, json("POST", { line })),
   addRoom: (floorId: string, body: { ring: [number, number][]; label?: string | null; kind?: RoomKind }) =>
     request<{ room_id: string; floor: Floor }>(`/api/floors/${floorId}/rooms`, json("POST", body)),
-  splitFloor: (floorId: string, body: { regions: SheetRegion[]; refit?: boolean; reconvert?: boolean }) =>
-    request<{ floor: Floor; floors: FloorSummary[]; job_ids: string[] }>(`/api/floors/${floorId}/split`, json("POST", body)),
+  splitFloor: (floorId: string, body: { regions: SheetRegion[]; refit?: boolean; reconvert?: boolean; also?: string[] }) =>
+    request<{ floor: Floor; floors: FloorSummary[]; also_cropped: string[]; job_ids: string[] }>(`/api/floors/${floorId}/split`, json("POST", body)),
   duplicateFloor: (floorId: string, body: { level?: number; name?: string } = {}) =>
     request<Floor>(`/api/floors/${floorId}/duplicate`, json("POST", body)),
   lineUpAll: (floorId: string) => request<{ moved: number }>(`/api/floors/${floorId}/line-up-all`, json("POST")),
