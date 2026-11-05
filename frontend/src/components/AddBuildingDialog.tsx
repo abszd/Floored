@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, MapPin, MousePointerClick, Search } from "lucide-react";
 import { api } from "../lib/api";
 import type { Building, Place } from "../lib/types";
+import AddressInput from "./AddressInput";
 import PlacePreviewMap from "./PlacePreviewMap";
 import { Modal, Spinner } from "./ui";
 import { useToast } from "./Toast";
@@ -31,7 +32,8 @@ export default function AddBuildingDialog({
   // The server's own lookup also tries simpler spellings of the address and
   // finds the OSM building by house number; the result is previewed first.
   const lookup = useMutation({
-    mutationFn: () => api.lookup({ address: submitted }),
+    mutationFn: (picked?: Place) =>
+      api.lookup(picked ? { address: picked.display_name, name: picked.name, lat: picked.lat, lon: picked.lon } : { address: submitted }),
     onSuccess: (r) => {
       setExisting(r.building);
       if (r.place) {
@@ -63,9 +65,21 @@ export default function AddBuildingDialog({
           setExisting(null);
         }}
       >
-        <div className="relative flex-1">
-          <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
-          <input autoFocus className="input pl-9" placeholder="Address or building name" value={q} onChange={(e) => setQ(e.target.value)} />
+        <div className="relative flex flex-1">
+          <Search className="pointer-events-none absolute left-3 top-2.5 z-10 h-4 w-4 text-slate-400" />
+          <AddressInput
+            autoFocus
+            className="pl-9"
+            placeholder="Start typing an address or building name"
+            value={q}
+            onChange={setQ}
+            onPick={(p) => {
+              setSubmitted("");
+              setChosen(null);
+              setExisting(null);
+              lookup.mutate(p);
+            }}
+          />
         </div>
         <button className="btn-primary" disabled={q.trim().length < 2}>
           Search
@@ -73,6 +87,11 @@ export default function AddBuildingDialog({
       </form>
 
       <div className="mt-4 space-y-1.5">
+        {lookup.isPending && (
+          <div className="flex items-center gap-2 text-sm text-slate-500">
+            <Spinner /> Finding the building there…
+          </div>
+        )}
         {results.isFetching && (
           <div className="flex items-center gap-2 text-sm text-slate-500">
             <Spinner /> Searching OpenStreetMap…
@@ -82,7 +101,7 @@ export default function AddBuildingDialog({
         {results.data?.length === 0 && (
           <div className="rounded-lg border border-dashed border-slate-300 px-3 py-3 text-sm text-slate-600">
             <div>No exact match on OpenStreetMap.</div>
-            <button className="btn-secondary mt-2" disabled={lookup.isPending} onClick={() => lookup.mutate()}>
+            <button className="btn-secondary mt-2" disabled={lookup.isPending} onClick={() => lookup.mutate(undefined)}>
               {lookup.isPending && <Spinner />} Find the building at this address
             </button>
             <div className="mt-2 text-xs text-slate-500">Or add the city, or click the building on the map.</div>

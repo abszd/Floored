@@ -183,12 +183,34 @@ def _nominatim(query: str, limit: int, viewbox: tuple[float, float, float, float
 _PHOTON_TYPES = {"N": "node", "W": "way", "R": "relation"}
 
 
-def _photon(query: str, limit: int, viewbox: tuple[float, float, float, float] | None) -> list[Place]:
+def suggest(query: str, *, near: tuple[float, float] | None = None, limit: int = 6) -> list[Place]:
+    """Address and place suggestions while the user is still typing.
+
+    Photon is built for search-as-you-type (Nominatim's usage policy forbids
+    it). ``near`` is a (lat, lon) that results close to are preferred, not
+    limited to.
+    """
+    if not get_settings().photon_url or len(query.strip()) < 3:
+        return []
+    return _photon(query, limit, None, near=near, min_interval=0.2, rank=False)
+
+
+def _photon(
+    query: str,
+    limit: int,
+    viewbox: tuple[float, float, float, float] | None,
+    *,
+    near: tuple[float, float] | None = None,
+    min_interval: float = 1.0,
+    rank: bool = True,
+) -> list[Place]:
     """Photon returns points only; the building outline is looked up afterwards."""
     params: dict[str, Any] = {"q": query, "limit": limit, "lang": "en"}
     if viewbox:
         params["bbox"] = ",".join(str(v) for v in viewbox)
-    data = http.get_json(f"{get_settings().photon_url}/api", params, min_interval=1.0)
+    if near:
+        params["lat"], params["lon"] = round(near[0], 3), round(near[1], 3)
+    data = http.get_json(f"{get_settings().photon_url}/api", params, min_interval=min_interval)
     places = []
     for f in data.get("features", []):
         props = f.get("properties") or {}
@@ -212,7 +234,7 @@ def _photon(query: str, limit: int, viewbox: tuple[float, float, float, float] |
                 address={k: str(props[k]) for k in ("housenumber", "street", "city", "state", "postcode", "country") if props.get(k)},
             )
         )
-    return _rank(places)
+    return _rank(places) if rank else places
 
 
 def reverse(lat: float, lon: float) -> Place | None:

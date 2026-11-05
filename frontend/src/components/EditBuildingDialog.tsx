@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { MapPin } from "lucide-react";
 import { api } from "../lib/api";
 import type { Building, Place } from "../lib/types";
+import AddressInput from "./AddressInput";
 import PlacePreviewMap from "./PlacePreviewMap";
 import { Modal, Spinner } from "./ui";
 import { useToast } from "./Toast";
@@ -22,7 +23,12 @@ export default function EditBuildingDialog({ building, onClose }: { building: Bu
   const converted = building.floors.filter((f) => f.status !== "pending" && f.status !== "processing" && f.status !== "error").length;
 
   const find = useMutation({
-    mutationFn: () => api.lookup({ name, address, exclude_building_id: building.id }),
+    mutationFn: (picked?: Place) =>
+      api.lookup(
+        picked
+          ? { name, address: picked.display_name, lat: picked.lat, lon: picked.lon, exclude_building_id: building.id }
+          : { name, address, exclude_building_id: building.id },
+      ),
     onSuccess: (r) => {
       if (r.building) toast.error("That's another building on your map", `${r.building.name} is already at that address.`);
       else setMoveTo(r.place);
@@ -55,23 +61,24 @@ export default function EditBuildingDialog({ building, onClose }: { building: Bu
         className="flex gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          if (address.trim().length > 1) find.mutate();
+          if (address.trim().length > 1) find.mutate(undefined);
         }}
       >
-        <input
-          className="input"
+        <AddressInput
           value={address}
-          placeholder="Street address, town"
-          onChange={(e) => {
-            setAddress(e.target.value);
+          placeholder="Start typing the street address"
+          near={{ lat: building.lat, lon: building.lon }}
+          onChange={(v) => {
+            setAddress(v);
             setMoveTo(null);
           }}
+          onPick={(p) => find.mutate(p)}
         />
         <button className="btn-secondary" disabled={address.trim().length < 2 || find.isPending}>
           {find.isPending ? <Spinner /> : <MapPin className="h-4 w-4" />} Find
         </button>
       </form>
-      <p className="mt-1 text-xs text-slate-500">Find the address to move the building there. Saving without finding it only changes the text.</p>
+      <p className="mt-1 text-xs text-slate-500">Pick a suggestion (or press Find) to move the building there. Saving without that only changes the text.</p>
 
       <div className="mt-3">
         <PlacePreviewMap place={moveTo} current={building} />

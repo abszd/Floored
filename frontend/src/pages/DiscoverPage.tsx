@@ -6,6 +6,7 @@ import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
 import type { Building, Candidate, Place, Source } from "../lib/types";
+import AddressInput from "../components/AddressInput";
 import PlacePreviewMap from "../components/PlacePreviewMap";
 import { ConfidenceBar, Empty, Modal, Spinner } from "../components/ui";
 import { useToast } from "../components/Toast";
@@ -331,7 +332,10 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
   );
 
   const lookup = useMutation({
-    mutationFn: (address: string) => api.lookup({ name: candidate.building_guess, address, hint }),
+    mutationFn: (target: string | Place) =>
+      typeof target === "string"
+        ? api.lookup({ name: candidate.building_guess, address: target, hint })
+        : api.lookup({ name: candidate.building_guess, address: target.display_name, lat: target.lat, lon: target.lon }),
     onSuccess: (r) => setPick(r.building ? { building: r.building } : r.place ? { place: r.place } : null),
     onError: (e: Error) => toast.error("Couldn't find that address", e.message),
   });
@@ -406,7 +410,7 @@ function ChooseBuildingDialog({ candidate, onClose }: { candidate: Candidate; on
             setGeoQ(q.trim());
           }}
         >
-          <input className="input" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Building name and city, or address" />
+          <AddressInput value={q} onChange={setQ} onPick={(p) => lookup.mutate(p)} near={{ hint }} placeholder="Start typing an address or building name" />
           <button className="btn-secondary">Search</button>
         </form>
         {places.isFetching && <Spinner className="mt-2" />}

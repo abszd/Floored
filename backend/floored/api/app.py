@@ -78,10 +78,28 @@ def geocode(q: str = Query(min_length=2), hint: str | None = None) -> list[dict[
         raise HTTPException(502, _geocoder_error(exc)) from exc
 
 
+@app.get("/api/suggest")
+def suggest(q: str = "", hint: str | None = None, lat: float | None = None, lon: float | None = None) -> list[dict[str, Any]]:
+    """Suggestions for an address box as the user types, nearest to ``hint`` (a town) or lat/lon first."""
+    near = (lat, lon) if lat is not None and lon is not None else None
+    try:
+        if near is None and hint:
+            area = next(iter(geocoder.search(hint, limit=1)), None)
+            near = (area.lat, area.lon) if area else None
+        places = geocoder.suggest(q, near=near)
+    except Exception as exc:
+        log.warning("suggestions failed for %r: %s", q, exc)
+        return []  # typing should never show an error; the search button still works
+    return [p.to_dict() for p in places]
+
+
 class LookupIn(BaseModel):
     name: str | None = None
     address: str | None = None
     hint: str | None = None
+    # A point the user picked from the address suggestions: the building there is used.
+    lat: float | None = None
+    lon: float | None = None
     # Leave this building out of the "already have it" check (when moving it).
     exclude_building_id: str | None = None
 
@@ -92,6 +110,8 @@ def lookup(body: LookupIn, s: Session = DB) -> dict[str, Any]:
 
     Lets the UI show the building on a map before the user commits to it.
     """
+    if body.lat is not None and body.lon is not None:
+        return _lookup_point(body, s)
     if not (body.name or body.address):
         raise HTTPException(422, "give a name or an address")
     try:
@@ -244,6 +264,26 @@ def patch_building(building_id: str, body: BuildingPatch, s: Session = DB) -> di
         setattr(b, k, v)
     s.flush()
     return ser.building_detail(b)
+
+
+def _lookup_point(body: LookupIn, s: Session) -> dict[str, Any]:
+    """The OSM building at a picked suggestion, or the bare point when there is none."""
+    lat, lon = body.lat, body.lon
+    try:
+        found = footprints.buildings_near(lat, lon, 25)
+    except Exception:
+        found = []
+    b = found[0] if found and (found[0]["contains"] or found[0]["distance_m"] < 8) else None
+    label = body.name or (body.address or "").split(",")[0] or None
+    if b is None:
+        place = {"name": label or "Unnamed building", "display_name": body.address or label, "lat": lat, "lon": lon,
+                 "osm_id": None, "footprint": None}
+        return {"confidence": 0.5, "reason": "picked point, no OSM building outline there", "building": None, "place": place}
+    existing = s.scalar(select(Building).where(Building.osm_id == b["osm_id"], Building.id != (body.exclude_building_id or "")))
+    if existing is not None:
+        return {"confidence": 1.0, "reason": "already on your map", "building": ser.building_detail(existing), "place": None}
+    place = matching._from_outline(b, label, body.address)
+    return {"confidence": 0.95, "reason": f"OSM building at {body.address or 'the picked point'}", "building": None, "place": place}
 
 
 class RelocateIn(BaseModel):
