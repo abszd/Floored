@@ -25,7 +25,19 @@ export interface FloorSummary {
   room_count: number;
   image_url: string | null;
   source_url: string | null;
+  /** Floors the converter thinks this sheet holds, when it wasn't sure enough to split it (0 otherwise). */
+  sheet_count: number;
+  /** What Undo would take back, if anything. */
+  undo: string | null;
   updated_at: string;
+}
+
+/** One part of a plan image, in image pixels: a crop, or one floor of a sheet. */
+export interface SheetRegion {
+  bbox: [number, number, number, number];
+  level?: number | null;
+  name?: string | null;
+  confidence?: number;
 }
 
 export interface Floor extends FloorSummary {
@@ -34,6 +46,11 @@ export interface Floor extends FloorSummary {
   placement: Placement | null;
   corners: [number, number][] | null;
   debug_images: Record<string, string>;
+  /** The converter's guess at separate floors on this sheet. */
+  sheets: SheetRegion[];
+  /** What the converter took as the building's outline, and its rooms, in image pixels. */
+  outline_px: [number, number][] | null;
+  rooms_px: [number, number][][];
   geojson: FeatureCollection | null;
 }
 

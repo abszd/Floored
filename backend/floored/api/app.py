@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from .. import http, jobs, pipeline, storage
+from .. import editing, http, jobs, pipeline, storage
 from ..config import get_settings
 from ..converters import ConversionResult, available_converters
 from ..converters.base import ROOM_KINDS
@@ -488,6 +488,7 @@ def put_placement(floor_id: str, body: PlacementIn, s: Session = DB) -> dict[str
     f = _get(s, Floor, floor_id)
     if f.conversion is None:
         raise HTTPException(409, "floor has not been converted yet")
+    pipeline.snapshot(f, "Move the plan")
     f.placement = body.model_dump()
     f.status = "placed"
     if f.building.footprint and f.image_width:
@@ -515,6 +516,7 @@ def autofit(floor_id: str, s: Session = DB) -> dict[str, Any]:
     f = _get(s, Floor, floor_id)
     if f.conversion is None:
         raise HTTPException(409, "floor has not been converted yet")
+    pipeline.snapshot(f, "Snap to outline")
     fit = pipeline.autoplace(f, f.building)
     s.flush()
     return {"floor": ser.floor_detail(f), "fit": fit}
@@ -526,16 +528,26 @@ def copy_placement(floor_id: str, from_floor_id: str = Query(...), s: Session = 
     f, other = _get(s, Floor, floor_id), _get(s, Floor, from_floor_id)
     if not other.placement:
         raise HTTPException(409, "the other floor is not placed")
-    p = Placement.from_dict(other.placement)
-    if f.image_width and other.image_width and (f.image_width, f.image_height) != (other.image_width, other.image_height):
-        # Same scale in metres per pixel, so different-sized exports still line up.
-        p.width_m = p.width_m * f.image_width / other.image_width
-        p.height_m = p.height_m * f.image_height / other.image_height
-    f.placement = p.to_dict()
-    f.status = "placed"
-    pipeline.refresh_geojson(f)
+    pipeline.snapshot(f, f"Line up with {other.name}")
+    pipeline.line_up(f, other)
     s.flush()
     return ser.floor_detail(f)
+
+
+@app.post("/api/floors/{floor_id}/line-up-all")
+def line_up_all(floor_id: str, s: Session = DB) -> dict[str, Any]:
+    """Put every other floor of the building where this one is."""
+    f = _get(s, Floor, floor_id)
+    if not f.placement:
+        raise HTTPException(409, "place this floor first")
+    moved = 0
+    for other in f.building.floors:
+        if other.id != f.id and other.conversion is not None:
+            pipeline.snapshot(other, f"Line up with {f.name}")
+            pipeline.line_up(other, f)
+            moved += 1
+    s.flush()
+    return {"moved": moved}
 
 
 @app.post("/api/floors/{floor_id}/reprocess")
@@ -557,6 +569,7 @@ def patch_room(floor_id: str, room_id: str, body: RoomPatch, s: Session = DB) ->
     rooms = [dict(r) for r in conv.get("rooms") or []]
     for r in rooms:
         if r["id"] == room_id:
+            pipeline.snapshot(f, "Rename room" if "label" in body.model_fields_set else "Change room type")
             for k, v in body.model_dump(exclude_unset=True).items():
                 r[k] = v
             break
@@ -579,6 +592,7 @@ class MergeIn(BaseModel):
 def merge_rooms(floor_id: str, body: MergeIn, s: Session = DB) -> dict[str, Any]:
     """Combine rooms the converter split (or that should be one) into a single room."""
     f = _get(s, Floor, floor_id)
+    pipeline.snapshot(f, f"Merge {len(body.room_ids)} rooms")
     try:
         room_id = pipeline.merge_rooms(f, body.room_ids, label=body.label, kind=body.kind)
     except LookupError as exc:
@@ -597,10 +611,179 @@ def delete_room(floor_id: str, room_id: str, s: Session = DB) -> dict[str, Any]:
     conv["rooms"] = [r for r in conv.get("rooms") or [] if r["id"] != room_id]
     if len(conv["rooms"]) == before:
         raise HTTPException(404, "room not found")
+    pipeline.snapshot(f, "Remove room")
     f.conversion = conv
     pipeline.refresh_geojson(f)
     s.flush()
     return ser.floor_detail(f)
+
+
+class DeleteIn(BaseModel):
+    room_ids: list[str] = []
+    # Walls and doors by their position in the plan (the number in their map id, "wall3").
+    walls: list[int] = []
+    doors: list[int] = []
+
+
+@app.post("/api/floors/{floor_id}/delete")
+def delete_features(floor_id: str, body: DeleteIn, s: Session = DB) -> dict[str, Any]:
+    """Remove many rooms, walls and doors at once (an area picked on the map)."""
+    f = _get(s, Floor, floor_id)
+    conv = dict(f.conversion or {})
+    rooms, walls, doors = set(body.room_ids), set(body.walls), set(body.doors)
+    before = (len(conv.get("rooms") or []), len(conv.get("walls") or []), len(conv.get("doors") or []))
+    conv["rooms"] = [r for r in conv.get("rooms") or [] if str(r["id"]) not in rooms]
+    conv["walls"] = [w for i, w in enumerate(conv.get("walls") or []) if i not in walls]
+    conv["doors"] = [d for i, d in enumerate(conv.get("doors") or []) if i not in doors]
+    removed = {
+        "rooms": before[0] - len(conv["rooms"]),
+        "walls": before[1] - len(conv["walls"]),
+        "doors": before[2] - len(conv["doors"]),
+    }
+    if not any(removed.values()):
+        raise HTTPException(404, "nothing to remove")
+    parts = [f"{n} {k if n != 1 else k[:-1]}" for k, n in removed.items() if n]
+    pipeline.snapshot(f, "Remove " + " and ".join(parts))
+    f.conversion = conv
+    pipeline.refresh_geojson(f)
+    s.flush()
+    return {"removed": removed, "floor": ser.floor_detail(f)}
+
+
+class RegionIn(BaseModel):
+    bbox: list[float] = Field(min_length=4, max_length=4)
+    level: float | None = None
+    name: str | None = None
+    outline: list[list[float]] | None = None
+
+
+class SplitIn(BaseModel):
+    regions: list[RegionIn] = Field(min_length=1, max_length=20)
+    refit: bool = True
+    # Run the converter again on every part (parts it found no rooms in always are).
+    reconvert: bool = False
+
+
+@app.post("/api/floors/{floor_id}/split")
+def split_floor(floor_id: str, body: SplitIn, s: Session = DB) -> dict[str, Any]:
+    """Crop a plan to the building (one area), or cut a sheet with several floors into one floor each."""
+    f = _get(s, Floor, floor_id)
+    try:
+        floors = pipeline.split_floor(s, f, [r.model_dump(exclude_none=True) for r in body.regions], refit=body.refit)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    redo = [x for x in floors if body.reconvert or not (x.conversion or {}).get("rooms")]
+    for x in redo:
+        x.status = "pending"
+    s.commit()
+    job_ids = [
+        jobs.submit("process_floor", {"floor_id": x.id, "split": False}, label=f"Converting {f.building.name} · {x.name}")
+        for x in redo
+    ]
+    s.expire_all()
+    return {"floor": ser.floor_detail(f), "floors": [ser.floor_summary(x) for x in floors], "job_ids": job_ids}
+
+
+class LineIn(BaseModel):
+    # Lon/lat on the map, or image pixels with ``pixels``.
+    line: list[list[float]] = Field(min_length=2)
+    pixels: bool = False
+
+
+def _to_pixels(f: Floor, coords: list[list[float]], pixels: bool) -> list[list[float]]:
+    if pixels:
+        return coords
+    if not f.placement or not f.image_width:
+        raise HTTPException(409, "the plan isn't on the map yet")
+    return editing.lines_to_pixels(Placement.from_dict(f.placement), coords, f.image_width, f.image_height)
+
+
+@app.post("/api/floors/{floor_id}/rooms/{room_id}/split")
+def split_room(floor_id: str, room_id: str, body: LineIn, s: Session = DB) -> dict[str, Any]:
+    """Cut a room in two along a line (the converter missed a wall)."""
+    f = _get(s, Floor, floor_id)
+    line = _to_pixels(f, body.line, body.pixels)
+    try:
+        conv, ids = editing.split_room(f.conversion or {}, room_id, line)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    pipeline.snapshot(f, "Split room")
+    f.conversion = conv
+    pipeline.refresh_geojson(f)
+    s.flush()
+    return {"room_ids": ids, "floor": ser.floor_detail(f)}
+
+
+class NewRoomIn(BaseModel):
+    ring: list[list[float]] = Field(min_length=3)
+    pixels: bool = False
+    label: str | None = None
+    kind: Literal["room", "corridor", "stair", "elevator", "restroom", "outdoor", "unknown"] = "room"
+
+
+@app.post("/api/floors/{floor_id}/rooms", status_code=201)
+def add_room(floor_id: str, body: NewRoomIn, s: Session = DB) -> dict[str, Any]:
+    """Draw a room the converter missed."""
+    f = _get(s, Floor, floor_id)
+    if f.conversion is None:
+        raise HTTPException(409, "floor has not been converted yet")
+    ring = _to_pixels(f, body.ring, body.pixels)
+    try:
+        conv, rid = editing.add_room(f.conversion, ring, label=body.label, kind=body.kind)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    pipeline.snapshot(f, "Draw room")
+    f.conversion = conv
+    pipeline.refresh_geojson(f)
+    s.flush()
+    return {"room_id": rid, "floor": ser.floor_detail(f)}
+
+
+class DuplicateIn(BaseModel):
+    level: float | None = None
+    name: str | None = None
+
+
+@app.post("/api/floors/{floor_id}/duplicate", status_code=201)
+def duplicate_floor(floor_id: str, body: DuplicateIn, s: Session = DB) -> dict[str, Any]:
+    """Copy a plan, with its rooms and placement, to another level (towers with identical floors)."""
+    f = _get(s, Floor, floor_id)
+    taken = {x.level for x in f.building.floors}
+    wanted = body.level if body.level is not None else f.level + 1
+    lvl = pipeline.free_level(taken, wanted)
+    copy = Floor(
+        building=f.building,
+        level=lvl,
+        name=body.name or pipeline.level_name(lvl),
+        level_note=None if lvl == wanted else f"{pipeline.level_name(wanted)} was taken; check which floor this is.",
+        status=f.status,
+        image_path=f.image_path,
+        image_width=f.image_width,
+        image_height=f.image_height,
+        converter=f.converter,
+        conversion=f.conversion,
+        placement=f.placement,
+        fit_score=f.fit_score,
+    )
+    s.add(copy)
+    s.flush()
+    pipeline.refresh_geojson(copy)
+    s.flush()
+    return ser.floor_detail(copy)
+
+
+@app.post("/api/floors/{floor_id}/undo")
+def undo_floor(floor_id: str, s: Session = DB) -> dict[str, Any]:
+    """Put the floor back as it was before its last change."""
+    f = _get(s, Floor, floor_id)
+    try:
+        label = pipeline.undo(s, f)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    s.flush()
+    return {"undone": label, "floor": ser.floor_detail(f)}
 
 
 # ------------------------------------------------------------------ sources & candidates
