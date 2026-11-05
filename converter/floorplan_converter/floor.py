@@ -492,9 +492,10 @@ def pdf_bytes(src):
     return None
 
 
-def pdf_text_items(data: bytes, page: int = 0) -> list:
-    """Text lines from a PDF page's text layer, in PDF points (y down). Empty when the
-    PDF has none (scans) or no PDF library is installed."""
+def pdf_text_items(data: bytes, page: int = 0, size=None) -> list:
+    """Text lines from a PDF page's text layer, in PDF points (y down), or in the
+    pixels of the page rendered at ``size`` (width, height). Empty when the PDF has
+    none (scans) or no PDF library is installed."""
     try:
         import pypdfium2 as pdfium
     except ImportError:
@@ -505,6 +506,9 @@ def pdf_text_items(data: bytes, page: int = 0) -> list:
             return []
         pg = doc[page]
         height = pg.get_height()
+        sx = sy = 1.0
+        if size is not None:
+            sx, sy = size[0] / max(pg.get_width(), 1e-6), size[1] / max(height, 1e-6)
         tp = pg.get_textpage()
         items = []
         for k in range(tp.count_rects()):
@@ -514,7 +518,7 @@ def pdf_text_items(data: bytes, page: int = 0) -> list:
             if not s:
                 continue
             quad = np.array([[left, height - top], [right, height - top],
-                             [right, height - bottom], [left, height - bottom]], np.float64)
+                             [right, height - bottom], [left, height - bottom]], np.float64) * (sx, sy)
             items.append(text_mod.TextItem(quad, s, 1.0))
         return items
     except Exception:

@@ -5,6 +5,7 @@
     floorplan-convert plan.png --debug-dir debug/   # also write the debug images
     floorplan-convert plan.png --geojson --bounds 43.07,43.08,-89.41,-89.40
     floorplan-convert plan.png --floor              # only which floor it shows (fast)
+    floorplan-convert sheet.pdf --sheets            # only where each floor is, if several
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import os
 import sys
 
-from . import __version__, convert, read_floor, to_geojson
+from . import __version__, convert, detect_sheets, read_floor, to_geojson
 
 
 def main(argv=None) -> int:
@@ -30,11 +31,16 @@ def main(argv=None) -> int:
     ap.add_argument("--bounds", help="south,north,west,east in degrees; places the outline in this box")
     ap.add_argument("--floor", action="store_true",
                     help="only read which floor the plan shows (text pass, no rooms)")
+    ap.add_argument("--sheets", action="store_true",
+                    help="only find the floors drawn on the sheet (null when it shows one)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
 
-    if args.floor:
-        found = read_floor(args.image, ocr=args.ocr, pdf_page=args.page)
+    if args.floor or args.sheets:
+        if args.floor:
+            found = read_floor(args.image, ocr=args.ocr, pdf_page=args.page)
+        else:
+            found = detect_sheets(args.image, ocr=args.ocr, pdf_page=args.page)
         text = json.dumps(found, indent=1)
         if args.output:
             with open(args.output, "w") as fh:

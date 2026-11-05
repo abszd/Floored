@@ -15,8 +15,9 @@ for room in result.rooms:
 result.to_dict()                # plain dict (see "Output format")
 result.meta["floor"]            # {"label": "Second Floor", "level": 2.0, "confidence": 0.93, ...}
 
-from floorplan_converter import read_floor
+from floorplan_converter import read_floor, detect_sheets
 read_floor(open("plan.png", "rb").read())   # the floor alone, in about a second
+detect_sheets(open("sheet.pdf", "rb").read())   # several floors on one sheet: where each is
 ```
 
 ```bash
@@ -24,6 +25,7 @@ pip install -e converter            # or: pip install -e "converter[pdf,dev]"
 floorplan-convert plan.png > rooms.json
 floorplan-convert plan.pdf --page 1 --debug-dir debug/
 floorplan-convert plan.png --floor              # which floor it shows, nothing else
+floorplan-convert sheet.pdf --sheets            # where each floor is on a sheet of several
 ```
 
 ## What changed from the old converter
@@ -77,7 +79,7 @@ spans x = 10.0 to 20.0. Rings are not closed (the first point is not repeated).
 | `doors` | `[[[x, y], [x, y]]]` | Lines across each closed doorway; `door_widths_px` and `door_kinds` (`door`, or `opening` where a room was split at a narrow neck) run alongside. |
 | `texts` | list | Every text read: `{text, quad, confidence, room_id}`. |
 | `scale_hint` | float or `null` | Estimated pixels per metre, from the typical door width (0.9 m). Only given when enough doors were seen. |
-| `meta` | dict | Converter version, working scale, detected style, wall and door size, timings, `crop` when the plan was cut out of a larger sheet, and `floor` (below). |
+| `meta` | dict | Converter version, working scale, detected style, wall and door size, timings, `crop` when the plan was cut out of a larger sheet, `floor` (below), and `sheets` when the sheet shows several floors (below). |
 | `debug_images` | `{name: png bytes}` | With `debug=True`: `text`, `walls`, `rooms`, `polygons`. Left out by `to_json_dict()`. |
 
 `kind: "outdoor"` marks unpainted areas inside a colour-filled plan: terraces,
@@ -106,6 +108,31 @@ basement or ground floor when they are the only letters used (`A210`, `B210`,
 one on the page, and outside the room labels (so grid bubbles, floor pickers
 and a table drawn as `10` are ignored). PDFs with a text layer are read
 directly, without OCR.
+
+### Sheets with several floors
+
+When one image shows several floors (side by side, stacked), each is converted on
+its own and `meta["sheets"]` lists them in reading order (rows top to bottom, then
+left to right). It is left out when the image shows one floor; wings of one
+building, however far apart, are one floor. Rooms, walls, doors and `footprint`
+cover every floor in sheet pixels; `outline` is the biggest floor's, and
+`meta["floor"]` is left out (each sheet has its own). Assign rooms to sheets by
+their centroid.
+
+| Key | |
+|---|---|
+| `bbox` | `[x0, y0, x1, y1]` of that floor's building drawing (not its title). |
+| `level`, `label` | From `floor` below, for convenience. |
+| `confidence` | That this is a floor of its own (0-1). From the text: 0.9 or more when each drawing names a different floor; 0.55 when nothing says but the drawings repeat one outline. Below 0.5 an editor should only suggest the split. |
+| `outline` | That floor's exterior ring. |
+| `floor` | As `meta["floor"]`, read from the text in and around that drawing. |
+
+`detect_sheets(image)` returns the same list (with `outline` null) without
+converting, or `None` for a single floor: a few seconds, mostly the text
+detection.
+
+Titles in heavy type, page frames and title blocks, legends, key plans and
+north arrows are never taken for the building (see `layout.py`).
 
 ### Putting it on a map
 
@@ -144,8 +171,15 @@ Pass as keyword arguments (`convert(img, debug=True, ocr="none")`) or as a
    working size. Ink is found by local contrast with hysteresis, so faint
    scans and coloured fills both work. Inverted (white-on-blue) plans are
    flipped.
-2. **Find the plan** (`walls.plan_bbox`): when the plan is a small part of the
-   sheet, crop around it and start again at a higher scale.
+2. **Find the plans** (`layout.py`): text is masked out (OCR detection only),
+   page and viewport frames are dropped with the title blocks and legend boxes
+   attached to them, and the rest is grouped by proximity. Tables, text blocks
+   and small drawings are sheet furniture; the longest remaining drawing is the
+   plan, and drawings comparable to it are wings or other floors. Which one is
+   decided by reading the text around each (a PDF's own text when it has some):
+   different floors named means separate plans, the same floor means wings.
+   Each plan is then converted on its own, on a crop around it when that gains
+   resolution.
 3. **Text** (`text.py`): OCR words plus shape-detected character runs, removed
    from the linework.
 4. **Walls** (`walls.py`, `graph.py`): fill double-line and hatched walls,
@@ -165,7 +199,10 @@ Pass as keyword arguments (`convert(img, debug=True, ocr="none")`) or as a
    free space between walls and closed doorways. In colour-filled plans fill
    boundaries separate rooms too. Small
    pieces are merged, furniture islands absorbed, and rooms joined through a
-   narrow neck are split there.
+   narrow neck are split there. Rooms that only a pale thin line separates
+   (zone and department lines, outlines of coloured patches, tile patterns) are
+   joined again: walls are drawn darker. Pale lines are also kept out of the
+   line-weight estimate, so they do not pull the wall threshold down.
 7. **Labels and kinds** (`classify.py`): texts are assigned to the room they
    fall in; names and numbers are separated; kinds come from the label (and
    stair treads).
@@ -183,12 +220,16 @@ cd converter
 pytest -q                                       # about a minute
 python bench/benchmark.py --seeds 0-2 -v        # quality per style
 python bench/benchmark.py --styles scan --seeds 0-9 --json scan.json
+python bench/benchmark.py --colouring           # zone lines and patches painted in rooms
+python bench/sheets.py -v                       # building found on whole sheets, floors told apart
 ```
 
 `floorplan_converter/synthetic.py` draws random plans in seven styles (solid,
 CAD, hatched, gray-filled, colour-filled, blueprint, scanned) with exact room
-masks, which is what the benchmark and tests score against. `bench/legacy.py`
-is a port of the old converter, used only for the comparison.
+masks, which is what the benchmark and tests score against. `bench/sheets.py`
+puts them on sheets with title blocks, heavy titles, legends, key plans or a
+second floor. `bench/legacy.py` is a port of the old converter, used only for
+the comparison.
 
 Known weak spots: stairs drawn as many separate treads are not always grouped
 into one stair room; very small plans with hairline interior walls (some

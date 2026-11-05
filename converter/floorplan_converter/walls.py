@@ -23,7 +23,7 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 
-from . import graph
+from . import graph, layout
 from . import skeleton as skel
 
 
@@ -40,13 +40,35 @@ class Walls:
     double_line: bool  # walls were drawn as parallel line pairs (and have been filled)
     removed: np.ndarray  # bool: ink removed as clutter (furniture, symbols, marks, arrows)
     coverage: np.ndarray  # float32 ink coverage used for sub-pixel width measurements
+    pale: np.ndarray = None  # bool: thin lines much paler than the walls (see pale_strokes)
 
     @property
     def thick_plan(self) -> bool:
         return self.tau > 0
 
 
-def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h: float) -> Walls:
+def pale_strokes(ink: np.ndarray, contrast: np.ndarray, rel: float = 0.5) -> np.ndarray:
+    """Thin lines much paler than the walls: zone and department lines, carpet and
+    tile patterns, outlines of coloured patches, stair treads, furniture. Thick pale
+    bands (walls drawn in gray) are not included."""
+    if not ink.any():
+        return np.zeros_like(ink)
+    # Darkest value within a pixel: a wall's anti-aliased edge still sees the wall.
+    core = cv2.dilate(contrast.astype(np.float32), np.ones((3, 3), np.uint8))
+    wall = float(np.percentile(core[ink], 90))
+    pale = ink & (core < rel * wall)
+    if not pale.any():
+        return pale
+    n, lab = cv2.connectedComponents(pale.astype(np.uint8), connectivity=8)
+    dt = cv2.distanceTransform(pale.astype(np.uint8), cv2.DIST_L2, 3)
+    thin = ndi.maximum(dt, lab, index=np.arange(n)) <= 1.5
+    thin[0] = False
+    return thin[lab]
+
+
+def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h: float, focus=None) -> Walls:
+    """Find the walls. ``focus`` (x0, y0, x1, y1) is where the plan was found on the
+    sheet; linework outside it (another floor, a title block) is dropped."""
     base = ink & ~text_mask
     base = _drop_specks(base, 4)
 
@@ -57,7 +79,7 @@ def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h
     prune_len = max(2, int(round(0.5 * width0)) + 1)
 
     kept, removed = _remove_clutter(solid, width0, text_h)
-    kept, bbox = _main_plan(kept, width0)
+    kept, bbox = _main_plan(kept, width0, focus, text_mask)
 
     g = graph.build(kept, coverage, prune_len)
     dim = _tick_dimensions(g, kept, width0)
@@ -72,7 +94,10 @@ def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h
         removed |= swing_mask & kept
         kept = _drop_specks(kept & ~swing_mask, max(4, int(width0 * width0)))
         g = graph.build(kept, coverage, prune_len)
-    tau, thin = _line_weights(g)
+    # Pale lines (colouring, patterns) are a class of their own: they would otherwise
+    # pass for the light line weight and pull the wall threshold down to them.
+    pale = pale_strokes(base, contrast)
+    tau, thin = _line_weights(g, _pale_branches(g, pale))
     from .gaps import estimate_door
 
     if tau > 0:
@@ -146,7 +171,7 @@ def extract(ink: np.ndarray, contrast: np.ndarray, text_mask: np.ndarray, text_h
         sel = lengths >= 2 * widths
     width = _weighted_percentile(widths[sel], lengths[sel], 50) if sel.any() else width0
     removed |= solid & ~kept
-    return Walls(kept, barrier, strong, max(float(width), 1.0), thin, tau, door, bbox, double_line, removed, coverage)
+    return Walls(kept, barrier, strong, max(float(width), 1.0), thin, tau, door, bbox, double_line, removed, coverage, pale)
 
 
 def _door_swings(g, mask: np.ndarray, wall_w: float, size: float):
@@ -248,16 +273,6 @@ def _fit_circle(pts: np.ndarray):
     r = float(np.sqrt(r2))
     resid = float(np.sqrt(np.mean((np.hypot(x - c[0], y - c[1]) - r) ** 2)))
     return c, r, resid
-
-
-def plan_bbox(ink: np.ndarray) -> tuple:
-    """Quick estimate of the plan's extent (x0, y0, x1, y1) on the sheet, before text is
-    found: the main cluster of linework, without legends, frames or title blocks."""
-    base = _drop_specks(ink, 4)
-    width0, _ = _stroke_widths(base)
-    kept, _ = _remove_clutter(base, width0, 0.0)
-    _, bbox = _main_plan(kept, width0)
-    return bbox
 
 
 def _tick_dimensions(g, mask: np.ndarray, width: float) -> np.ndarray:
@@ -463,7 +478,18 @@ def _open_arrows(g, door: float) -> list:
     return sorted(out)
 
 
-def _line_weights(g):
+def _pale_branches(g, pale: np.ndarray) -> np.ndarray:
+    """Per branch: most of its pixels are pale strokes."""
+    n = len(g.branches)
+    if not n or not pale.any():
+        return np.zeros(n, bool)
+    own = g.owner
+    tot = np.bincount(own[own >= 0], minlength=n)
+    on = np.bincount(own[(own >= 0) & pale], minlength=n)
+    return on >= 0.5 * np.maximum(tot, 1)
+
+
+def _line_weights(g, skip=None):
     """Find the annotation line weight, if the drawing has one distinct from the walls.
 
     Returns (tau, thin): branches lighter than ``tau`` are minor linework candidates
@@ -475,7 +501,8 @@ def _line_weights(g):
     leaves drawn a little heavier than furniture still fall on the light side. Whether the light class is annotation or a
     lighter class of walls is decided later from its shapes (see ``_light_is_wall``).
     """
-    sel = [b for b in g.branches if b.length >= max(4.0, 2.0 * b.width)]
+    sel = [b for i, b in enumerate(g.branches)
+           if b.length >= max(4.0, 2.0 * b.width) and (skip is None or not skip[i])]
     if len(sel) < 5:
         return 0.0, 1.0
     ws = np.array([b.width for b in sel])
@@ -744,76 +771,33 @@ def _remove_clutter(mask: np.ndarray, width: float, text_h: float):
     return kept, mask & ~kept
 
 
-def _main_plan(mask: np.ndarray, width: float):
-    """Keep the cluster of wall components that forms the plan; drop page frames and
-    anything far from the building (legends, title blocks, north arrows)."""
+def _main_plan(mask: np.ndarray, width: float, focus=None, text=None):
+    """Keep the linework that forms the plan; drop page frames, title blocks, legends,
+    key plans and anything else that is not the building (see layout.py). With
+    ``focus``, only the plan drawn there (other floors on the sheet are dropped)."""
     H, W = mask.shape
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-    if n <= 1:
+    mask = layout.remove_frames(mask)
+    if focus is not None:
+        # Linework well outside the plan picked on the sheet (a title in heavy type,
+        # another floor) must not join it into one group.
+        x0, y0, x1, y1 = layout.focus_box(focus, mask.shape, 2 * width)
+        clipped = np.zeros_like(mask)
+        clipped[y0:y1, x0:x1] = mask[y0:y1, x0:x1]
+        mask = clipped
+    lay = layout.group(mask, width, text)
+    if not lay.groups:
         return mask, (0, 0, W, H)
-    for i in range(1, n):
-        x, y, bw, bh = (int(v) for v in stats[i, :4])
-        if bw < 0.8 * W or bh < 0.8 * H:
-            continue
-        # A page frame: nearly the whole page, with most pixels hugging its bbox edges.
-        sub = lab[y:y + bh, x:x + bw] == i
-        band = max(3, int(0.04 * min(bw, bh)))
-        edge = np.zeros_like(sub)
-        edge[:band] = edge[-band:] = True
-        edge[:, :band] = edge[:, -band:] = True
-        if (sub & edge).sum() > 0.6 * sub.sum():
-            region = mask[y:y + bh, x:x + bw]
-            frame = sub & edge
-            region[frame] = False
-            # Lines attached to the frame from the inside (title block, legend boxes)
-            # belong to the sheet, not the building.
-            touch = cv2.dilate(frame.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-            n2, lab2 = cv2.connectedComponents((region & sub).astype(np.uint8), connectivity=8)
-            hit = np.unique(lab2[touch & (lab2 > 0)])
-            if hit.size:
-                region[np.isin(lab2, hit)] = False
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    keep = lay.comparable
+    if focus is not None:
+        inside = layout.focused(lay, mask, focus)
+        if inside:
+            main = lay.groups[inside[0]]
+            keep = [main.id] + [k for k in inside[1:] if layout.comparable(lay.groups[k], main)]
+    out = mask & np.isin(lay.labels, keep)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), connectivity=8)
     if n <= 1:
-        return mask, (0, 0, W, H)
-    bw, bh, area = stats[:, 2].astype(np.float64), stats[:, 3].astype(np.float64), stats[:, 4].astype(np.float64)
-    score = area / max(width, 1.0)  # ~ skeleton length
-    score[0] = 0
-    main = int(np.argmax(score))
-    # Group components that sit close together; the plan is the group holding the main one.
-    gap = int(max(3 * width, 0.05 * float(np.hypot(bw[main], bh[main]))))
-    f = 2 if max(H, W) > 1500 else 1
-    m = mask.astype(np.uint8)
-    if f > 1:
-        m = cv2.resize(m, (W // f, H // f), interpolation=cv2.INTER_NEAREST)
-    r = max(1, gap // f)
-    grouped = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
-    if f > 1:
-        grouped = cv2.resize(grouped, (W, H), interpolation=cv2.INTER_NEAREST)
-    ng, glab = cv2.connectedComponents(grouped, connectivity=8)
-    ys, xs = np.nonzero(lab == main)
-    g_main = int(glab[ys[0], xs[0]])
-    keep = [g_main]
-    if ng > 2:
-        # Other wings drawn apart on the same sheet: groups with a comparable amount of
-        # linework, enclosing comparable floor area, drawn at the same wall weight.
-        dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
-        gl = np.where(mask, glab, 0)
-        length = np.bincount(gl.ravel(), minlength=ng).astype(np.float64)
-
-        def stats_of(k):
-            sl = ndi.find_objects((gl == k).astype(np.int32))[0]
-            sub = gl[sl] == k
-            filled = float(ndi.binary_fill_holes(sub).sum() - sub.sum())
-            return filled, float(np.percentile(dt[sl][sub], 90))
-
-        f_main, w_main = stats_of(g_main)
-        for k in range(1, ng):
-            if k == g_main or length[k] < 0.2 * length[g_main]:
-                continue
-            f_k, w_k = stats_of(k)
-            if f_k >= 0.1 * f_main and w_k >= 0.7 * w_main:
-                keep.append(k)
-    out = mask & np.isin(glab, keep)
+        return out, (0, 0, W, H)
+    main = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
     # Dimension lines: long, thin, separate components lying outside the building's extent.
     mx0, my0, mw, mh = (float(v) for v in stats[main, :4])
     for i in range(1, n):

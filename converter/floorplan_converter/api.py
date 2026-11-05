@@ -11,7 +11,7 @@ import numpy as np
 from scipy import ndimage as ndi
 
 from . import __version__
-from . import classify, fills, floor, gaps, geometry, graph, rooms, style, text, walls
+from . import classify, fills, floor, gaps, geometry, graph, layout, rooms, style, text, walls
 from .loading import load_image, make_working
 from .options import ConverterOptions
 from .result import ConversionResult, Door, Room, TextLabel, Wall
@@ -32,14 +32,55 @@ def convert(image, options: ConverterOptions = None, **kwargs) -> ConversionResu
     if kwargs:
         opts = ConverterOptions.from_kwargs(**{**asdict(opts), **kwargs})
     img = load_image(image, opts.pdf_page, opts.pdf_dpi)
-    res, items = _convert(img, opts, opts.auto_crop)
-    if opts.read_floor:
+    res, items = _convert(img, opts, top=True, page_text=_pdf_text(image, img, opts.pdf_page))
+    if opts.read_floor and "sheets" not in res.meta:  # several floors: each read its own
         t = time.perf_counter()
         res.meta["floor"] = _floor(image, img, items, res, opts)
         timings = res.meta["timings_s"]
         timings["floor"] = round(time.perf_counter() - t, 3)
         timings["total"] = round(timings.get("total", 0.0) + timings["floor"], 3)
     return res
+
+
+def detect_sheets(image, ocr: str = "auto", pdf_page: int = 0, pdf_dpi: int = 200):
+    """Where the floors are on a sheet that shows several, without converting them.
+
+    Returns ``None`` when the image shows one floor (wings of one building count as
+    one), else one entry per floor in reading order, like ``meta["sheets"]`` from
+    :func:`convert` but with ``outline`` None: ``{"bbox": [x0, y0, x1, y1]`` (image
+    pixels), ``"level"``, ``"label"``, ``"confidence"`` (that it is a floor of its
+    own), ``"outline"``, ``"floor"`` (as from :func:`read_floor`)``}``.
+    """
+    opts = ConverterOptions(ocr=ocr, pdf_page=pdf_page, pdf_dpi=pdf_dpi)
+    img = load_image(image, opts.pdf_page, opts.pdf_dpi)
+    wk = make_working(img, opts.max_working_size, opts.min_working_size)
+    sty = style.analyze(wk.bgr)
+    page_text = _pdf_text(image, img, opts.pdf_page)
+    plans = layout.find((255 - wk.bgr) if sty.inverted else wk.bgr, sty.ink, text.get_backend(opts.ocr),
+                        page_text=_scaled_items(page_text, wk.scale))[0]
+    if len(plans) < 2:
+        return None
+    out = []
+    for p in plans:
+        fl = p.floor
+        out.append({"bbox": [round(v / wk.scale, 1) for v in p.bbox], "level": fl["level"] if fl else None,
+                    "label": fl["label"] if fl else None, "confidence": p.confidence, "outline": None,
+                    "floor": fl})
+    return out
+
+
+def _pdf_text(image, img: np.ndarray, page: int):
+    """A PDF input's own text, in the pixels of its rendered page (None otherwise)."""
+    pdf = floor.pdf_bytes(image)
+    if pdf is None:
+        return None
+    return floor.pdf_text_items(pdf, page, size=(img.shape[1], img.shape[0])) or None
+
+
+def _scaled_items(items, scale: float):
+    if not items:
+        return None
+    return [text.TextItem(np.asarray(it.quad, np.float64) * scale, it.text, it.confidence) for it in items]
 
 
 def _floor(image, img: np.ndarray, items: list, res: ConversionResult, opts: ConverterOptions):
@@ -64,8 +105,12 @@ def _floor(image, img: np.ndarray, items: list, res: ConversionResult, opts: Con
     return floor.floor_from_texts(items)
 
 
-def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool):
-    """Run the pipeline; returns the result and the text read (original pixels)."""
+def _convert(img: np.ndarray, opts: ConverterOptions, top: bool = False, focus=None, page_text=None):
+    """Run the pipeline; returns the result and the text read (original pixels).
+
+    At the top level the plans on the sheet are found first: the converter then runs
+    on each floor drawn on it, cropped around it when that gains resolution. ``focus``
+    (x0, y0, x1, y1, image pixels) is the plan to keep."""
     timings = {}
     t_start = t = time.perf_counter()
 
@@ -80,29 +125,34 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool):
     sty = style.analyze(bgr)
     lap("load_and_style")
 
-    box = None
-    if crop_ok:
-        box = _crop_box(walls.plan_bbox(sty.ink), wk.scale, img.shape, opts)
-        lap("find_plan")
-    if box is not None:
-        # The plan fills only part of the sheet: run again on the plan alone, which
-        # gets more working resolution for its thin lines.
-        x0, y0, x1, y1 = box
-        res, items = _convert(img[y0:y1, x0:x1], opts, False)
-        res = _translate(res, x0, y0, img.shape)
-        for it in items:
-            it.quad = it.quad + np.array([x0, y0], np.float64)
-        res.meta["crop"] = [x0, y0, x1, y1]
-        res.meta["timings_s"] = {**timings, **res.meta["timings_s"],
-                                 "total": round(time.perf_counter() - t_start, 3)}
-        return res, items
-
     backend = text.get_backend(opts.ocr)
+    boxes = None
+    if top:
+        ocr_img = (255 - bgr) if sty.inverted else bgr
+        plans, _, _, boxes = layout.find(ocr_img, sty.ink, backend, page_text=_scaled_items(page_text, wk.scale))
+        lap("find_plan")
+        foci = [tuple(v / wk.scale for v in p.bbox) for p in plans]
+        if len(plans) > 1:
+            parts = [_convert_part(img, opts, f, True) for f in foci]
+            res, items = _merge(parts, plans, img.shape)
+            res.meta["timings_s"] = {**timings, "total": round(time.perf_counter() - t_start, 3)}
+            return res, items
+        focus = foci[0]
+        box = _crop_box(plans[0].bbox, wk.scale, img.shape, opts) if opts.auto_crop else None
+        if box is not None:
+            # The plan fills only part of the sheet: run again on the plan alone, which
+            # gets more working resolution for its thin lines.
+            res, items = _convert_part(img, opts, focus, box)
+            res.meta["timings_s"] = {**timings, **res.meta["timings_s"],
+                                     "total": round(time.perf_counter() - t_start, 3)}
+            return res, items
+
     ocr_img = (255 - bgr) if sty.inverted else bgr
-    tr = text.find_text(ocr_img, sty.ink, backend)
+    tr = text.find_text(ocr_img, sty.ink, backend, boxes=boxes)
     lap("text")
 
-    W = walls.extract(sty.ink, sty.contrast, tr.mask, tr.text_height)
+    W = walls.extract(sty.ink, sty.contrast, tr.mask, tr.text_height,
+                      focus=None if focus is None else tuple(v * wk.scale for v in focus))
     barrier = W.barrier
     prune_len = max(2, int(round(0.5 * W.width)) + 1)
     g = graph.build(barrier, W.coverage, prune_len)
@@ -158,6 +208,11 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool):
     labels = rooms.fill_region_holes(labels, full_barrier, max(4 * min_area, 1.0))
     labels, cuts = rooms.split_necks(labels, min_area, door, opts.neck_ratio, g_max)
     labels = rooms.merge_small(labels, min_area, W.width, weak, keep_ids=stair_ids)
+    if W.pale.any():
+        # Zone lines and other colouring drawn across a room do not split it.
+        labels = rooms.merge_pale(labels, full_barrier, W.pale, 1.5 * door, tr.mask, gr.mask, keep_ids=stair_ids)
+        near_pale = cv2.dilate(W.pale.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        labels = rooms.close_thin_separators(labels, full_barrier & near_pale, W.width)
     lap("rooms")
 
     # Unpainted areas inside a painted plan are outdoor (decks, terraces, courtyards).
@@ -322,6 +377,69 @@ def _convert(img: np.ndarray, opts: ConverterOptions, crop_ok: bool):
         timings["debug"] = round(time.perf_counter() - t, 3)
     timings["total"] = round(time.perf_counter() - t_start, 3)
     return result, [text.TextItem(it.quad / scale, it.text, it.confidence) for it in tr.items]
+
+
+def _convert_part(img: np.ndarray, opts: ConverterOptions, focus, box):
+    """Convert the plan at ``focus`` (image pixels) on a crop around it. ``box`` is the
+    crop, or True for the usual margin around the plan."""
+    if box is True:
+        x0, y0, x1, y1 = focus
+        m = 0.12 * max(x1 - x0, y1 - y0) + 16
+        h, w = img.shape[:2]
+        box = (max(0, int(x0 - m)), max(0, int(y0 - m)), min(w, int(np.ceil(x1 + m))), min(h, int(np.ceil(y1 + m))))
+    x0, y0, x1, y1 = box
+    f = tuple(float(v) for v in np.subtract(focus, (x0, y0, x0, y0)))
+    res, items = _convert(img[y0:y1, x0:x1], opts, focus=f)
+    res = _translate(res, x0, y0, img.shape)
+    for it in items:
+        it.quad = it.quad + np.array([x0, y0], np.float64)
+    res.meta["crop"] = [x0, y0, x1, y1]
+    return res, items
+
+
+def _merge(parts: list, plans: list, shape):
+    """One result for a sheet of several floors: everything in sheet pixels, and
+    ``meta["sheets"]`` saying where each floor is and which it is."""
+    rooms, texts, walls_, doors, footprint, sheets, items = [], [], [], [], [], [], []
+    for (res, its), plan in zip(parts, plans):
+        ids = {}
+        for r in res.rooms:
+            ids[r.id] = r.id = f"r{len(rooms) + 1}"
+            rooms.append(r)
+        for t in res.texts:
+            t.room_id = ids.get(t.room_id)
+        texts += res.texts
+        walls_ += res.walls
+        doors += res.doors
+        footprint += res.footprint
+        items += its
+        own = floor.floor_from_texts(its)
+        fl = plan.floor if plan.floor is not None and (own is None or plan.floor["confidence"] >= own["confidence"]) else own
+        res.meta["floor"] = fl
+        pts = np.array([p for part in res.footprint for p in part["polygon"]] or [[0.0, 0.0]])
+        bbox = ([round(float(v), 1) for v in (*pts.min(axis=0), *pts.max(axis=0))] if res.footprint
+                else [round(float(v), 1) for v in res.meta["crop"]])
+        sheets.append({"bbox": bbox, "level": fl["level"] if fl else None, "label": fl["label"] if fl else None,
+                       "confidence": plan.confidence, "outline": res.outline, "floor": fl})
+    areas = [_ring_area(res.outline) for res, _ in parts]
+    big = parts[int(np.argmax(areas))][0]
+    hints = [res.scale_hint for res, _ in parts if res.scale_hint]
+    meta = {k: v for k, v in big.meta.items() if k != "crop"}
+    meta["sheets"] = sheets
+    out = ConversionResult(
+        image_size=[int(shape[1]), int(shape[0])],
+        outline=big.outline, rooms=rooms, footprint=footprint, walls=walls_, doors=doors, texts=texts,
+        scale_hint=round(float(np.median(hints)), 2) if hints else None, meta=meta,
+    )
+    out.debug_images = big.debug_images
+    return out, items
+
+
+def _ring_area(ring) -> float:
+    if not ring:
+        return 0.0
+    p = np.asarray(ring, np.float64)
+    return 0.5 * abs(float(np.dot(p[:, 0], np.roll(p[:, 1], 1)) - np.dot(p[:, 1], np.roll(p[:, 0], 1))))
 
 
 def _crop_box(bbox, scale: float, shape, opts: ConverterOptions):

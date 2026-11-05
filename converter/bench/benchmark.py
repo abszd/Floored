@@ -3,6 +3,7 @@
     python bench/benchmark.py --seeds 0-4                 # all styles, 5 plans each
     python bench/benchmark.py --styles cad,scan --legacy  # also score the old converter
     python bench/benchmark.py --seeds 0-9 --json out.json
+    python bench/benchmark.py --colouring                 # with zone lines and patches in rooms
 
 For every plan, predicted rooms are rasterised and matched one-to-one to the true
 rooms by IoU (Hungarian matching). Reported per style:
@@ -109,8 +110,10 @@ def outline_iou(footprint_gt: np.ndarray, footprint_parts) -> float:
 
 
 def run_one(job):
-    style, seed, legacy, ocr = job
+    style, seed, legacy, ocr, colouring = (*job, False)[:5]
     plan = synthetic.generate(seed, style)
+    if colouring:
+        plan = synthetic.add_colouring(plan, seed)
     t = time.perf_counter()
     res = convert(plan.image, ocr=ocr)
     dt = time.perf_counter() - t
@@ -164,13 +167,15 @@ def main(argv=None):
     ap.add_argument("--styles", default=",".join(synthetic.STYLES))
     ap.add_argument("--seeds", default="0-2")
     ap.add_argument("--legacy", action="store_true", help="also score the old watershed converter")
+    ap.add_argument("--colouring", action="store_true",
+                    help="paint zone lines, patches and tile grids inside rooms (see synthetic.add_colouring)")
     ap.add_argument("--ocr", default="auto")
     ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     ap.add_argument("--json", help="write per-plan rows to this file")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every plan")
     args = ap.parse_args(argv)
 
-    jobs = [(s, k, args.legacy, args.ocr) for s in args.styles.split(",") for k in _seeds(args.seeds)]
+    jobs = [(s, k, args.legacy, args.ocr, args.colouring) for s in args.styles.split(",") for k in _seeds(args.seeds)]
     if args.workers > 1:
         with ProcessPoolExecutor(args.workers) as ex:
             rows = list(ex.map(run_one, jobs))

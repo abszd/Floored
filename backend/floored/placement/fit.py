@@ -9,6 +9,12 @@ footprint's, then polishing with Nelder–Mead.
 Plans are drawn to scale, so the x and y scales are kept close to each other
 by a penalty rather than fixed equal: scanned or re-exported images are often
 stretched a little, and allowing a few percent of anisotropy fixes that.
+
+When another floor of the building is already placed (by a person, or by a
+clear fit), its rotation and metres per pixel are a ``prior``: one more start,
+and the tie-break between orientations the outline alone cannot tell apart
+(square and symmetric buildings), in place of the plain north-up preference.
+Floors of one building are almost always drawn the same way round.
 """
 
 from __future__ import annotations
@@ -32,6 +38,10 @@ ANISOTROPY_WEIGHT = 4.0
 # Small preference for north-up when the footprint is symmetric and IoU can't
 # tell the orientations apart.
 NORTH_UP_WEIGHT = 0.01
+# Preference for the rotation of the building's other floors, when there is one.
+PRIOR_WEIGHT = 0.02
+# A fit within this many degrees of the prior counts as agreeing with it.
+PRIOR_AGREES_DEG = 10.0
 
 
 @dataclass
@@ -40,17 +50,22 @@ class FitResult:
     iou: float
     # Other orientations considered, best first: (iou, rotation_deg).
     alternatives: list[tuple[float, float]] = field(default_factory=list)
+    # The fit turned the plan the way the building's other floors are.
+    agrees_with_prior: bool = False
 
     @property
     def ambiguous(self) -> bool:
-        """True when another orientation fits nearly as well (square-ish buildings)."""
-        return bool(self.alternatives) and self.alternatives[0][0] > self.iou - 0.03
+        """True when another orientation fits nearly as well (square-ish buildings)
+        and no other floor of the building settles it."""
+        close = bool(self.alternatives) and self.alternatives[0][0] > self.iou - 0.03
+        return close and not self.agrees_with_prior
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "placement": self.placement.to_dict(),
             "iou": self.iou,
             "ambiguous": self.ambiguous,
+            "agrees_with_prior": self.agrees_with_prior,
             "alternatives": [{"iou": i, "rotation_deg": r} for i, r in self.alternatives],
         }
 
@@ -103,12 +118,19 @@ def _angle_from_north(bearing: float) -> float:
     return min(b, 360 - b)
 
 
+def _angle_between(a: float, b: float) -> float:
+    return _angle_from_north(a - b)
+
+
 def fit_to_footprint(
     conv: ConversionResult,
     footprint_geojson: dict[str, Any],
     *,
     allow_mirror: bool = False,
+    prior: tuple[float, float] | None = None,
 ) -> FitResult | None:
+    """Fit the plan outline onto the footprint. ``prior`` is (rotation_deg, metres per
+    pixel) of another floor of the building that is already placed."""
     outline_px = plan_outline(conv)
     if outline_px is None:
         return None
@@ -141,18 +163,24 @@ def fit_to_footprint(
         _, lsx, lsy, _, _ = params
         iou = _iou(build(params, mirror), fp)
         bearing = -params[0]
-        return (1 - iou) + ANISOTROPY_WEIGHT * (lsx - lsy) ** 2 + NORTH_UP_WEIGHT * _angle_from_north(bearing) / 180
+        if prior is not None:
+            turn = PRIOR_WEIGHT * _angle_between(bearing, prior[0]) / 180
+        else:
+            turn = NORTH_UP_WEIGHT * _angle_from_north(bearing) / 180
+        return (1 - iou) + ANISOTROPY_WEIGHT * (lsx - lsy) ** 2 + turn
 
     results: list[tuple[float, float, np.ndarray, bool]] = []
     for mirror in (False, True) if allow_mirror else (False,):
         base = (-phi_plan if not mirror else phi_plan - 180)
-        for k in range(4):
-            phi = phi_fp + base + 90 * k
+        starts = [(phi_fp + base + 90 * k, scale0) for k in range(4)]
+        if prior is not None and not mirror:
+            starts.append((-prior[0], prior[1] if prior[1] and prior[1] > 0 else scale0))
+        for phi, sc in starts:
             # Translate so the plan's centroid lands on the footprint's.
-            g = affinity.scale(pc, (-1 if mirror else 1) * scale0, scale0, origin=(0, 0))
+            g = affinity.scale(pc, (-1 if mirror else 1) * sc, sc, origin=(0, 0))
             g = affinity.rotate(g, phi, origin=(0, 0))
             cx, cy = g.x, g.y
-            x0 = np.array([phi, math.log(scale0), math.log(scale0), -cx, -cy])
+            x0 = np.array([phi, math.log(sc), math.log(sc), -cx, -cy])
             res = minimize(
                 cost,
                 x0,
@@ -176,9 +204,17 @@ def fit_to_footprint(
         rotation_deg=(-phi) % 360,
         mirror=mirror,
     )
-    alternatives = [(round(r[1], 4), round((-r[2][0]) % 360, 2)) for r in results[1:]]
+    # Other orientations: one per distinct rotation (the prior's start may land on one
+    # of the others).
+    alternatives: list[tuple[float, float]] = []
+    for r in results[1:]:
+        rot = round((-r[2][0]) % 360, 2)
+        if _angle_between(rot, placement.rotation_deg) < 5 or any(_angle_between(rot, a[1]) < 5 for a in alternatives):
+            continue
+        alternatives.append((round(r[1], 4), rot))
     alternatives.sort(key=lambda a: -a[0])
-    return FitResult(placement=placement, iou=round(best_iou, 4), alternatives=alternatives)
+    agrees = prior is not None and _angle_between(placement.rotation_deg, prior[0]) <= PRIOR_AGREES_DEG
+    return FitResult(placement=placement, iou=round(best_iou, 4), alternatives=alternatives, agrees_with_prior=agrees)
 
 
 def _simplex(x0: np.ndarray, scale0: float, fp: Polygon) -> np.ndarray:

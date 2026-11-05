@@ -22,11 +22,15 @@ Styles
 ``color_fill`` Wayfinding map with a pastel color per room type and thin walls.
 ``blueprint``  White linework on a blue background.
 ``scan``       Solid walls on a photocopied or scanned page: tilt, blur, noise, shading.
+
+``add_colouring(plan, seed)`` paints inside rooms the way department and zone maps do
+(lines across a room, tinted or outlined patches over part of it, light tile grids),
+none of which must split a room.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -752,3 +756,69 @@ def _scan_effects(rng, plan):
     plan.image, plan.labels, plan.footprint = img, labels, footprint
     plan.meta["rotation_deg"] = ang
     return plan
+
+
+# ---------------------------------------------------------------------------
+# Colouring inside rooms
+# ---------------------------------------------------------------------------
+
+_PAINT = [(60, 140, 230), (200, 120, 40), (90, 170, 90), (170, 90, 200), (40, 190, 220), (150, 150, 150)]
+
+
+def add_colouring(plan: SynthPlan, seed: int = 0, share: float = 0.5) -> SynthPlan:
+    """The plan with colouring drawn inside about ``share`` of its larger rooms: a thin
+    line across the room, a tinted patch over part of it (outlined or not), or a light
+    tile grid. The rooms are unchanged, so the converter should find the same ones.
+    ``meta["colouring"]`` says what went where."""
+    rng = np.random.default_rng(5000 + seed)
+    img = plan.image.copy()
+    lab = plan.labels
+    ppm = plan.px_per_m
+    ids = [r.id for r in plan.rooms if r.kind in ("room", "corridor")]
+    rng.shuffle(ids)
+    done = {}
+    for rid in ids[:max(1, int(share * len(ids)))]:
+        m = lab == rid
+        ys, xs = np.nonzero(m)
+        if len(xs) < (3 * ppm) ** 2:
+            continue
+        x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
+        if min(x1 - x0, y1 - y0) < 2.5 * ppm:
+            continue
+        kind = str(rng.choice(["line", "patch", "outlined_patch", "grid"]))
+        col = _PAINT[int(rng.integers(len(_PAINT)))]
+        layer = np.zeros(m.shape, np.uint8)
+        if kind == "line":
+            th = int(rng.integers(1, 3))
+            if rng.random() < 0.5:
+                y = int(rng.uniform(y0 + 0.3 * (y1 - y0), y0 + 0.7 * (y1 - y0)))
+                cv2.line(layer, (x0, y), (x1, y), 1, th)
+            else:
+                x = int(rng.uniform(x0 + 0.3 * (x1 - x0), x0 + 0.7 * (x1 - x0)))
+                cv2.line(layer, (x, y0), (x, y1), 1, th)
+            img[layer.astype(bool) & m] = col
+        elif kind in ("patch", "outlined_patch"):
+            light = np.array([255 - 0.35 * (255 - c) for c in col], np.float32)
+            if rng.random() < 0.5:
+                cut = int(rng.uniform(x0 + 0.35 * (x1 - x0), x0 + 0.65 * (x1 - x0)))
+                cv2.rectangle(layer, (x0, y0), (cut, y1), 1, -1)
+            else:
+                cut = int(rng.uniform(y0 + 0.35 * (y1 - y0), y0 + 0.65 * (y1 - y0)))
+                cv2.rectangle(layer, (x0, y0), (x1, cut), 1, -1)
+            sel = layer.astype(bool) & m
+            # Tint, keeping the drawing's dark marks on top.
+            keep = sel & (img.mean(axis=2) >= 120)
+            img[keep] = (0.5 * img[keep].astype(np.float32) + 0.5 * light).astype(np.uint8)
+            if kind == "outlined_patch":
+                edge = sel & ~cv2.erode(sel.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+                edge &= cv2.erode(m.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+                img[edge] = col
+        else:  # carpet tiles
+            step = int(max(8, rng.uniform(0.8, 1.5) * ppm))
+            for x in range(x0 + step, x1, step):
+                cv2.line(layer, (x, y0), (x, y1), 1, 1)
+            for y in range(y0 + step, y1, step):
+                cv2.line(layer, (x0, y), (x1, y), 1, 1)
+            img[layer.astype(bool) & m & (img.mean(axis=2) > 120)] = (205, 205, 205)
+        done[rid] = kind
+    return replace(plan, image=img, meta={**plan.meta, "colouring": done})
