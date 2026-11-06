@@ -59,6 +59,14 @@ class OcrBackend:
     def detect(self, bgr: np.ndarray) -> list:  # pragma: no cover - interface
         return []
 
+    def boxes(self, bgr: np.ndarray) -> list:
+        """Where the text is (quads), without reading it."""
+        return [it.quad for it in self.detect(bgr)]
+
+    def read(self, bgr: np.ndarray, boxes: list) -> list:
+        """Read the text in boxes found by :meth:`boxes`."""
+        return self.detect(bgr)
+
 
 class _RapidOcr(OcrBackend):
     name = "rapidocr"
@@ -69,25 +77,30 @@ class _RapidOcr(OcrBackend):
         self.engine = RapidOCR()
 
     def detect(self, bgr):
-        eng = self.engine
+        return self.read(bgr, self.boxes(bgr))
+
+    def boxes(self, bgr):
         h, w = bgr.shape[:2]
         if h < 32 or w < 32:
             return []
         # rapidocr-onnxruntime 1.4 calls these text_det and text_rec; 1.2 used longer names.
-        det = getattr(eng, "text_detector", None) or eng.text_det
-        rec = getattr(eng, "text_recognizer", None) or eng.text_rec
+        det = getattr(self.engine, "text_detector", None) or self.engine.text_det
         det.postprocess_op.box_thresh = 0.45
         det.postprocess_op.unclip_ratio = 1.6
         boxes = det(bgr)[0]
         if boxes is None or len(boxes) == 0:
             return []
-        boxes = eng.sorted_boxes(boxes)
-        crops = eng.get_crop_img_list(bgr, boxes)
-        recs = rec(crops)[0]
-        items = []
-        for box, r in zip(boxes, recs):
-            items.append(TextItem(np.asarray(box, np.float64).reshape(4, 2), str(r[0]).strip(), float(r[1])))
-        return items
+        return [np.asarray(b, np.float64).reshape(4, 2) for b in self.engine.sorted_boxes(boxes)]
+
+    def read(self, bgr, boxes):
+        if not len(boxes):
+            return []
+        eng = self.engine
+        rec = getattr(eng, "text_recognizer", None) or eng.text_rec
+        quads = np.array([np.asarray(b, np.float32).reshape(4, 2) for b in boxes])
+        recs = rec(eng.get_crop_img_list(bgr, quads))[0]
+        return [TextItem(np.asarray(box, np.float64).reshape(4, 2), str(r[0]).strip(), float(r[1]))
+                for box, r in zip(boxes, recs)]
 
 
 class _Tesseract(OcrBackend):
@@ -144,12 +157,14 @@ class TextResult:
     stroke: float  # typical text stroke width in working pixels (0 if unknown)
 
 
-def find_text(bgr: np.ndarray, ink: np.ndarray, backend: OcrBackend) -> TextResult:
+def find_text(bgr: np.ndarray, ink: np.ndarray, backend: OcrBackend, boxes=None) -> TextResult:
+    """Text on the plan: OCR items, a mask over the lettering and its typical height.
+    ``boxes``: where the text is, when already found on this same image."""
     h, w = ink.shape
     items = []
     if backend.name != "none":
         try:
-            items = backend.detect(bgr)
+            items = backend.detect(bgr) if boxes is None else backend.read(bgr, boxes)
         except Exception as exc:  # OCR must never take the conversion down
             log.warning("OCR failed (%s); continuing without it", exc)
             items = []

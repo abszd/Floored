@@ -247,6 +247,59 @@ def merge_enclosed(labels: np.ndarray, max_area: float, wall_w: float, weak: np.
     return labels
 
 
+def merge_pale(labels: np.ndarray, barrier: np.ndarray, pale: np.ndarray, min_len: float,
+               ignore: np.ndarray = None, doors: np.ndarray = None, keep_ids=()) -> np.ndarray:
+    """Join rooms that only a pale thin line separates (a zone or colouring line, the
+    outline of a coloured patch): walls are drawn darker than that, whatever the size
+    of the rooms on either side. Separators shorter than ``min_len`` may be a doorway
+    with its threshold drawn, and closed ``doors`` are doorways, so neither counts.
+    ``ignore`` (text, which pale lines run through) does not count either way."""
+    near_pale = cv2.dilate(pale.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    if doors is not None:
+        near_pale &= ~doors
+    counted = barrier if ignore is None else barrier & ~ignore
+    # The separator between two rooms: barrier pixels close to both. A thin line lies
+    # entirely within this reach of both sides; a real wall's core does not.
+    reach = 3
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))
+    H, W = labels.shape
+    parent = {}
+
+    def find(a):
+        while parent.get(a, a) != a:
+            a = parent[a]
+        return a
+
+    for rid, sl in enumerate(ndi.find_objects(labels), start=1):
+        if sl is None or rid in keep_ids:
+            continue
+        y0, y1 = max(0, sl[0].start - 2 * reach), min(H, sl[0].stop + 2 * reach)
+        x0, x1 = max(0, sl[1].start - 2 * reach), min(W, sl[1].stop + 2 * reach)
+        sub = labels[y0:y1, x0:x1]
+        ring = cv2.dilate((sub == rid).astype(np.uint8), k).astype(bool) & barrier[y0:y1, x0:x1]
+        if not near_pale[y0:y1, x0:x1][ring].any():
+            continue
+        for v in np.unique(sub[cv2.dilate(ring.astype(np.uint8), k).astype(bool)]):
+            v = int(v)
+            if v <= rid or v in keep_ids:
+                continue
+            sep = ring & cv2.dilate((sub == v).astype(np.uint8), k).astype(bool)
+            sep &= counted[y0:y1, x0:x1]
+            if sep.sum() < 3:
+                continue
+            sy, sx = np.nonzero(sep)
+            if max(sx.max() - sx.min(), sy.max() - sy.min()) + 1 < min_len:
+                continue
+            if near_pale[y0:y1, x0:x1][sep].mean() >= 0.6:
+                parent[find(v)] = find(rid)
+    if not parent:
+        return labels
+    lut = np.arange(int(labels.max()) + 1)
+    for a in range(1, lut.size):
+        lut[a] = find(a)
+    return lut[labels]
+
+
 def fill_region_holes(labels: np.ndarray, barrier: np.ndarray, max_hole: float) -> np.ndarray:
     """Fill small holes inside a room (columns, removed furniture, leftover marks)."""
     out = labels.copy()

@@ -108,11 +108,25 @@ def refresh_geojson(floor: Floor) -> None:
     )
 
 
+def placement_prior(floor: Floor, building: Building) -> tuple[float, float] | None:
+    """(rotation_deg, metres per pixel) of the building's most recently placed other
+    floor: floors of one building are drawn the same way round, usually at one scale."""
+    placed = [
+        f for f in building.floors
+        if f.id != floor.id and f.placement and f.status == "placed" and f.image_width
+    ]
+    if not placed:
+        return None
+    other = max(placed, key=lambda f: str(f.updated_at or f.created_at or ""))
+    p = Placement.from_dict(other.placement)
+    return p.rotation_deg, p.width_m / other.image_width
+
+
 def autoplace(floor: Floor, building: Building) -> dict[str, Any]:
     """Fit the plan onto the building footprint, or fall back to a sized guess."""
     conv = _conversion(floor)
     if building.footprint:
-        fit = fit_to_footprint(conv, building.footprint)
+        fit = fit_to_footprint(conv, building.footprint, prior=placement_prior(floor, building))
         if fit is not None:
             floor.placement = fit.placement.to_dict()
             floor.fit_score = fit.iou

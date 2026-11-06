@@ -69,6 +69,31 @@ def test_fit_rectangle_flags_ambiguity():
     assert fit.ambiguous
 
 
+@pytest.mark.parametrize("prior_bearing", [20, 200])
+def test_other_floors_settle_a_symmetric_fit(prior_bearing):
+    # A rectangle fits as well either way round; another floor of the building that is
+    # already placed says which.
+    w, h = 1000, 800
+    outline = [[100, 100], [900, 100], [900, 700], [100, 700]]
+    conv = ConversionResult(image_size=(w, h), rooms=[], outline=outline)
+    fit = fit_to_footprint(conv, _footprint(60, 45, 20), prior=(prior_bearing, 0.075))
+    assert fit.iou > 0.95
+    diff = (fit.placement.rotation_deg - prior_bearing + 180) % 360 - 180
+    assert abs(diff) < 2
+    assert fit.agrees_with_prior and not fit.ambiguous
+
+
+def test_prior_does_not_override_a_clear_fit():
+    w, h = 1000, 800
+    outline = [[100, 100], [900, 100], [900, 400], [500, 400], [500, 700], [100, 700]]
+    conv = ConversionResult(image_size=(w, h), rooms=[], outline=outline)
+    truth = Placement(LON, LAT, 80, 64, rotation_deg=25)
+    fp = mapping(Polygon([truth.pixel_to_lonlat(x, y, w, h) for x, y in outline]))
+    fit = fit_to_footprint(conv, fp, prior=(115, 0.08))  # another floor turned a quarter
+    assert abs((fit.placement.rotation_deg - 25 + 180) % 360 - 180) < 1.5
+    assert fit.iou > 0.97 and not fit.agrees_with_prior
+
+
 def test_outline_from_rooms_when_converter_has_none():
     rooms = [
         Room("a", [[100, 100], [495, 100], [495, 400], [100, 400]]),
