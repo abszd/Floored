@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, Globe, Image as ImageIcon, Inbox, MapPin, Pencil, Play, Plus, RefreshCw, Trash2, Wand2 } from "lucide-react";
+import { ExternalLink, Globe, History, Image as ImageIcon, Inbox, MapPin, Pencil, Play, Plus, RefreshCw, Trash2, Wand2 } from "lucide-react";
 import { api, mediaUrl } from "../lib/api";
 import { useJobs } from "../lib/jobs";
 import { levelShort } from "../lib/placement";
@@ -142,6 +142,7 @@ function SourceCard({ source }: { source: Source }) {
   const qc = useQueryClient();
   const { track, active, setPanelOpen } = useJobs();
   const [editing, setEditing] = useState(false);
+  const [rerun, setRerun] = useState(false);
   const running = active.find((j) => j.kind === "crawl" && j.payload.source_id === source.id);
   const crawl = useMutation({
     mutationFn: () => api.crawl(source.id),
@@ -179,19 +180,110 @@ function SourceCard({ source }: { source: Source }) {
           </button>
         </div>
       ) : (
-        <div className="mt-3 flex items-center justify-between">
-          <div className="text-xs text-slate-500">
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <div className="min-w-0 truncate text-xs text-slate-500">
             {source.last_crawled_at ? `${found} plans found` : "Not crawled yet"}
             {source.location_hint && <span> · {source.location_hint}</span>}
           </div>
-          <button className="btn-secondary px-2 py-1 text-xs" onClick={() => crawl.mutate()} disabled={crawl.isPending}>
-            {source.last_crawled_at ? <RefreshCw className="h-3 w-3" /> : <Play className="h-3 w-3" />}
-            {source.last_crawled_at ? "Crawl again" : "Crawl"}
-          </button>
+          <div className="flex shrink-0 items-center gap-1 whitespace-nowrap">
+            {(source.saved.responses > 0 || found > 0) && (
+              <button className="btn-ghost px-2 py-1 text-xs" onClick={() => setRerun(true)} title="Run it again from scratch, from saved copies of the site">
+                <History className="h-3 w-3" /> Re-run
+              </button>
+            )}
+            <button className="btn-secondary px-2 py-1 text-xs" onClick={() => crawl.mutate()} disabled={crawl.isPending}>
+              {source.last_crawled_at ? <RefreshCw className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+              {source.last_crawled_at ? "Crawl again" : "Crawl"}
+            </button>
+          </div>
         </div>
       )}
       {editing && <AddSourceDialog source={source} onClose={() => setEditing(false)} />}
+      {rerun && <RerunDialog source={source} onClose={() => setRerun(false)} />}
     </div>
+  );
+}
+
+function megabytes(b: number) {
+  return b < 1e6 ? `${Math.max(1, Math.round(b / 1e3))} KB` : `${(b / 1e6).toFixed(b < 1e8 ? 1 : 0)} MB`;
+}
+
+/** Run a website again from scratch, from saved copies, to test changes without hitting the site. */
+function RerunDialog({ source, onClose }: { source: Source; onClose: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { track, setPanelOpen } = useJobs();
+  const hasSaved = source.saved.responses > 0;
+  const [useSaved, setUseSaved] = useState(hasSaved);
+  const [fresh, setFresh] = useState(true);
+  const [offMap, setOffMap] = useState(false);
+  const onMap = (source.candidate_counts.approved ?? 0) + (source.candidate_counts.processed ?? 0);
+  const run = useMutation({
+    mutationFn: () => api.crawl(source.id, { use_saved: useSaved, fresh, remove_from_map: fresh && offMap }),
+    onSuccess: ({ job_id, reset }) => {
+      track(job_id, `Re-run of ${source.name}`);
+      qc.invalidateQueries();
+      setPanelOpen(true);
+      if (reset && (reset.plans || reset.floors))
+        toast.success("Started over", `Cleared ${reset.plans} plan${reset.plans === 1 ? "" : "s"}${reset.floors ? ` and ${reset.floors} floor${reset.floors === 1 ? "" : "s"} on the map` : ""}.`);
+      onClose();
+    },
+    onError: (e: Error) => toast.error("Couldn't start", e.message),
+  });
+  const clear = useMutation({
+    mutationFn: () => api.clearSaved(source.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["sources"] });
+      setUseSaved(false);
+      toast.success("Saved copies deleted", "The next crawl downloads everything again.");
+    },
+  });
+  return (
+    <Modal title={`Re-run ${source.name}`} onClose={onClose}>
+      <div className="space-y-3 text-sm">
+        <label className={`flex items-start gap-2 ${hasSaved ? "" : "opacity-50"}`}>
+          <input type="checkbox" className="mt-1 accent-indigo-600" disabled={!hasSaved} checked={useSaved} onChange={(e) => setUseSaved(e.target.checked)} />
+          <span>
+            Use saved copies of the site
+            <span className="block text-xs text-slate-500">
+              {hasSaved
+                ? `${source.saved.responses.toLocaleString()} pages and files (${megabytes(source.saved.bytes)}) from earlier crawls. Only anything missing is downloaded. Building lookups are saved too.`
+                : "Nothing saved yet. This crawl saves a copy of everything it downloads, so the next re-run can use it."}
+            </span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2">
+          <input type="checkbox" className="mt-1 accent-indigo-600" checked={fresh} onChange={(e) => setFresh(e.target.checked)} />
+          <span>
+            Start over
+            <span className="block text-xs text-slate-500">Forget the plans earlier crawls found and waiting for review, and find them all again.</span>
+          </span>
+        </label>
+        {fresh && onMap > 0 && (
+          <label className="ml-6 flex items-start gap-2">
+            <input type="checkbox" className="mt-1 accent-indigo-600" checked={offMap} onChange={(e) => setOffMap(e.target.checked)} />
+            <span>
+              Also take its {onMap} plan{onMap === 1 ? "" : "s"} off the map
+              <span className="block text-xs text-slate-500">So matching and conversion run again for them too. Room fixes on those floors are lost.</span>
+            </span>
+          </label>
+        )}
+        <div className="flex items-center gap-2 pt-2">
+          {hasSaved && (
+            <button className="btn-ghost px-2 py-1 text-xs text-slate-500" disabled={clear.isPending} onClick={() => confirm("Delete the saved copies of this website?") && clear.mutate()}>
+              Delete saved copies
+            </button>
+          )}
+          <div className="flex-1" />
+          <button className="btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn-primary" disabled={run.isPending} onClick={() => run.mutate()}>
+            {run.isPending ? <Spinner /> : <History className="h-4 w-4" />} Re-run
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

@@ -469,7 +469,10 @@ def patch_floor(floor_id: str, body: FloorPatch, s: Session = DB) -> dict[str, A
     f = _get(s, Floor, floor_id)
     changes = body.model_dump(exclude_unset=True)
     if changes.get("level") is not None and changes["level"] != f.level:
+        pipeline.log_fix(s, f, "set_level", before=f.level, after=changes["level"], note=f.level_note)
         pipeline.set_floor_level(f, changes.pop("level"))
+    if changes.get("name") and changes["name"] != f.name:
+        pipeline.log_fix(s, f, "rename_floor", before=f.name, after=changes["name"])
     changes.pop("level", None)
     for k, v in changes.items():
         setattr(f, k, v)
@@ -489,6 +492,7 @@ def put_placement(floor_id: str, body: PlacementIn, s: Session = DB) -> dict[str
     if f.conversion is None:
         raise HTTPException(409, "floor has not been converted yet")
     pipeline.snapshot(f, "Move the plan")
+    pipeline.log_fix(s, f, "move", before=f.placement, after=body.model_dump())
     f.placement = body.model_dump()
     f.status = "placed"
     if f.building.footprint and f.image_width:
@@ -517,6 +521,7 @@ def autofit(floor_id: str, s: Session = DB) -> dict[str, Any]:
     if f.conversion is None:
         raise HTTPException(409, "floor has not been converted yet")
     pipeline.snapshot(f, "Snap to outline")
+    pipeline.log_fix(s, f, "autofit", before=f.placement)
     fit = pipeline.autoplace(f, f.building)
     s.flush()
     return {"floor": ser.floor_detail(f), "fit": fit}
@@ -529,6 +534,7 @@ def copy_placement(floor_id: str, from_floor_id: str = Query(...), s: Session = 
     if not other.placement:
         raise HTTPException(409, "the other floor is not placed")
     pipeline.snapshot(f, f"Line up with {other.name}")
+    pipeline.log_fix(s, f, "line_up", source_floor=other.id, before=f.placement)
     pipeline.line_up(f, other)
     s.flush()
     return ser.floor_detail(f)
@@ -544,6 +550,7 @@ def line_up_all(floor_id: str, s: Session = DB) -> dict[str, Any]:
     for other in f.building.floors:
         if other.id != f.id and other.conversion is not None:
             pipeline.snapshot(other, f"Line up with {f.name}")
+            pipeline.log_fix(s, other, "line_up", source_floor=f.id, before=other.placement)
             pipeline.line_up(other, f)
             moved += 1
     s.flush()
@@ -553,6 +560,8 @@ def line_up_all(floor_id: str, s: Session = DB) -> dict[str, Any]:
 @app.post("/api/floors/{floor_id}/reprocess")
 def reprocess(floor_id: str, converter: str | None = None, keep_placement: bool = True, s: Session = DB) -> dict[str, Any]:
     f = _get(s, Floor, floor_id)
+    pipeline.log_fix(s, f, "reconvert", converter=converter, keep_placement=keep_placement)
+    s.commit()
     return {
         "job_id": jobs.submit(
             "process_floor",
@@ -570,6 +579,10 @@ def patch_room(floor_id: str, room_id: str, body: RoomPatch, s: Session = DB) ->
     for r in rooms:
         if r["id"] == room_id:
             pipeline.snapshot(f, "Rename room" if "label" in body.model_fields_set else "Change room type")
+            if "label" in body.model_fields_set and body.label != r.get("label"):
+                pipeline.log_fix(s, f, "rename", room_id=room_id, before=r.get("label"), after=body.label)
+            if body.kind is not None and body.kind != r.get("kind"):
+                pipeline.log_fix(s, f, "set_kind", room_id=room_id, before=r.get("kind"), after=body.kind)
             for k, v in body.model_dump(exclude_unset=True).items():
                 r[k] = v
             break
@@ -593,6 +606,7 @@ def merge_rooms(floor_id: str, body: MergeIn, s: Session = DB) -> dict[str, Any]
     """Combine rooms the converter split (or that should be one) into a single room."""
     f = _get(s, Floor, floor_id)
     pipeline.snapshot(f, f"Merge {len(body.room_ids)} rooms")
+    pipeline.log_fix(s, f, "merge_rooms", room_ids=body.room_ids, label=body.label, kind=body.kind)
     try:
         room_id = pipeline.merge_rooms(f, body.room_ids, label=body.label, kind=body.kind)
     except LookupError as exc:
@@ -612,6 +626,7 @@ def delete_room(floor_id: str, room_id: str, s: Session = DB) -> dict[str, Any]:
     if len(conv["rooms"]) == before:
         raise HTTPException(404, "room not found")
     pipeline.snapshot(f, "Remove room")
+    pipeline.log_fix(s, f, "delete_room", room_ids=[room_id])
     f.conversion = conv
     pipeline.refresh_geojson(f)
     s.flush()
@@ -644,6 +659,14 @@ def delete_features(floor_id: str, body: DeleteIn, s: Session = DB) -> dict[str,
         raise HTTPException(404, "nothing to remove")
     parts = [f"{n} {k if n != 1 else k[:-1]}" for k, n in removed.items() if n]
     pipeline.snapshot(f, "Remove " + " and ".join(parts))
+    if body.room_ids:
+        pipeline.log_fix(s, f, "delete_room", room_ids=body.room_ids)
+    if body.walls or body.doors:
+        pipeline.log_fix(
+            s, f, "delete_lines",
+            walls=[(f.conversion or {}).get("walls", [])[i] for i in body.walls if i < len((f.conversion or {}).get("walls") or [])],
+            doors=[(f.conversion or {}).get("doors", [])[i] for i in body.doors if i < len((f.conversion or {}).get("doors") or [])],
+        )
     f.conversion = conv
     pipeline.refresh_geojson(f)
     s.flush()
@@ -662,6 +685,8 @@ class SplitIn(BaseModel):
     refit: bool = True
     # Run the converter again on every part (parts it found no rooms in always are).
     reconvert: bool = False
+    # Crop these floors the same way too (other pages of the same file, at the same size).
+    also: list[str] = []
 
 
 @app.post("/api/floors/{floor_id}/split")
@@ -669,10 +694,25 @@ def split_floor(floor_id: str, body: SplitIn, s: Session = DB) -> dict[str, Any]
     """Crop a plan to the building (one area), or cut a sheet with several floors into one floor each."""
     f = _get(s, Floor, floor_id)
     try:
-        floors = pipeline.split_floor(s, f, [r.model_dump(exclude_none=True) for r in body.regions], refit=body.refit)
+        regions = [r.model_dump(exclude_none=True) for r in body.regions]
+        size = list((f.conversion or {}).get("image_size") or [f.image_width, f.image_height])
+        floors = pipeline.split_floor(s, f, regions, refit=body.refit)
+        pipeline.log_fix(
+            s, f, "crop" if len(regions) == 1 else "split_floor",
+            regions=regions, image_size=size, new_floors=[x.id for x in floors[1:]], reconvert=body.reconvert,
+        )
+        extra: list[Floor] = []
+        if len(regions) == 1:
+            for oid in body.also:
+                o = s.get(Floor, oid)
+                if o is None or o.building_id != f.building_id or [o.image_width, o.image_height] != size:
+                    continue
+                pipeline.split_floor(s, o, [{"bbox": regions[0]["bbox"]}], refit=body.refit, label="Crop like another page")
+                pipeline.log_fix(s, o, "crop", regions=[{"bbox": regions[0]["bbox"]}], image_size=size, new_floors=[], copied_from=f.id)
+                extra.append(o)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    redo = [x for x in floors if body.reconvert or not (x.conversion or {}).get("rooms")]
+    redo = [x for x in floors + extra if body.reconvert or not (x.conversion or {}).get("rooms")]
     for x in redo:
         x.status = "pending"
     s.commit()
@@ -681,7 +721,12 @@ def split_floor(floor_id: str, body: SplitIn, s: Session = DB) -> dict[str, Any]
         for x in redo
     ]
     s.expire_all()
-    return {"floor": ser.floor_detail(f), "floors": [ser.floor_summary(x) for x in floors], "job_ids": job_ids}
+    return {
+        "floor": ser.floor_detail(f),
+        "floors": [ser.floor_summary(x) for x in floors],
+        "also_cropped": [x.id for x in extra],
+        "job_ids": job_ids,
+    }
 
 
 class LineIn(BaseModel):
@@ -710,6 +755,7 @@ def split_room(floor_id: str, room_id: str, body: LineIn, s: Session = DB) -> di
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     pipeline.snapshot(f, "Split room")
+    pipeline.log_fix(s, f, "split_room", room_id=room_id, line=line, new_rooms=ids)
     f.conversion = conv
     pipeline.refresh_geojson(f)
     s.flush()
@@ -735,6 +781,7 @@ def add_room(floor_id: str, body: NewRoomIn, s: Session = DB) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     pipeline.snapshot(f, "Draw room")
+    pipeline.log_fix(s, f, "add_room", room_id=rid, ring=ring, label=body.label, kind=body.kind)
     f.conversion = conv
     pipeline.refresh_geojson(f)
     s.flush()
@@ -769,6 +816,7 @@ def duplicate_floor(floor_id: str, body: DuplicateIn, s: Session = DB) -> dict[s
     )
     s.add(copy)
     s.flush()
+    pipeline.log_fix(s, copy, "copy_floor", source_floor=f.id)
     pipeline.refresh_geojson(copy)
     s.flush()
     return ser.floor_detail(copy)
@@ -780,6 +828,7 @@ def undo_floor(floor_id: str, s: Session = DB) -> dict[str, Any]:
     f = _get(s, Floor, floor_id)
     try:
         label = pipeline.undo(s, f)
+        pipeline.log_fix(s, f, "undo", undone=label)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     s.flush()
@@ -858,13 +907,36 @@ def delete_source(source_id: str, s: Session = DB) -> None:
     s.delete(_get(s, Source, source_id))
 
 
+@app.delete("/api/sources/{source_id}/saved", status_code=204)
+def clear_saved(source_id: str, s: Session = DB) -> None:
+    """Delete the pages and files saved from this website, so the next crawl downloads them again."""
+    from ..scraper import cache
+
+    cache.clear(ser._source_domains(_get(s, Source, source_id)))
+
+
+class CrawlIn(BaseModel):
+    # Use pages and files saved by an earlier crawl instead of asking the site again.
+    use_saved: bool = False
+    # Start over: forget the plans earlier crawls found (see pipeline.reset_source).
+    fresh: bool = False
+    remove_from_map: bool = False
+
+
 @app.post("/api/sources/{source_id}/crawl")
-def crawl_source(source_id: str, s: Session = DB) -> dict[str, Any]:
+def crawl_source(source_id: str, body: CrawlIn | None = None, s: Session = DB) -> dict[str, Any]:
+    body = body or CrawlIn()
     src = _get(s, Source, source_id)
     for j in s.scalars(select(Job).where(Job.kind == "crawl", Job.status.in_(("queued", "running")))):
         if (j.payload or {}).get("source_id") == source_id:
+            if body.fresh:
+                raise HTTPException(409, "this website is being crawled; stop that first")
             return {"job_id": j.id}  # already crawling it
-    return {"job_id": jobs.submit("crawl", {"source_id": source_id}, label=f"Crawling {src.name}")}
+    reset = pipeline.reset_source(s, src, remove_from_map=body.remove_from_map) if body.fresh else None
+    s.commit()
+    label = f"{'Re-running' if body.fresh else 'Crawling'} {src.name}{' from saved copies' if body.use_saved else ''}"
+    job_id = jobs.submit("crawl", {"source_id": source_id, "use_saved": body.use_saved}, label=label)
+    return {"job_id": job_id, "reset": reset}
 
 
 @app.get("/api/candidates")
@@ -1027,6 +1099,13 @@ def confirm_draft(draft_id: str, body: ConfirmIn, s: Session = DB) -> dict[str, 
         b, ids = pipeline.confirm_draft(s, d, building_id=building_id, place=place, name=body.name, address=body.address)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    # How the building match was settled, to tune matching: kept the suggestion or chose another.
+    suggested = sugg.get("building_id") or (sugg.get("place") or {}).get("osm_id")
+    pipeline.log_fix(
+        s, None, "match", building_id=b.id, draft=d.name, address=d.address, suggested=suggested,
+        confidence=sugg.get("confidence"), reason=sugg.get("reason"), chosen=b.osm_id or b.id,
+        kept=bool(suggested) and suggested in (b.id, b.osm_id), name=body.name, address_given=body.address,
+    )
     building = ser.building_summary(b)
     s.commit()
     job_ids = pipeline.submit_conversions(ids)

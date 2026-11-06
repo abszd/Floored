@@ -11,6 +11,7 @@ import httpx
 
 from .. import http
 from ..config import get_settings
+from . import cache
 
 MAX_BYTES = 40 * 1024 * 1024
 
@@ -32,8 +33,20 @@ class Response:
 
 
 class Fetcher:
-    def __init__(self, delay_s: float | None = None) -> None:
-        self.delay_s = get_settings().crawl_delay_s if delay_s is None else delay_s
+    """Downloads pages and files for a crawl.
+
+    ``use_saved`` answers from copies saved by an earlier crawl when there is
+    one, without contacting the site. ``save`` keeps a copy of everything
+    fetched (the ``FLOORED_CRAWL_CACHE`` setting decides the defaults).
+    """
+
+    def __init__(self, delay_s: float | None = None, *, use_saved: bool | None = None, save: bool | None = None) -> None:
+        settings = get_settings()
+        self.delay_s = settings.crawl_delay_s if delay_s is None else delay_s
+        self.use_saved = settings.crawl_cache == "reuse" if use_saved is None else use_saved
+        self.save = settings.crawl_cache != "off" if save is None else save
+        self.from_saved = 0
+        self.downloaded = 0
         self._robots: dict[str, robotparser.RobotFileParser | None] = {}
         self._lock = threading.Lock()
 
@@ -61,6 +74,19 @@ class Fetcher:
         return rp is None or rp.can_fetch(get_settings().user_agent, url)
 
     def get(self, url: str) -> Response | None:
+        if self.use_saved:
+            hit = cache.load(url)
+            if hit is not None:
+                self.from_saved += 1
+                return Response(hit.url, hit.status, hit.content_type, hit.content)
+        resp = self._download(url)
+        if resp is not None:
+            self.downloaded += 1
+            if self.save:
+                cache.save(url, resp.url, resp.status, resp.content_type, resp.content)
+        return resp
+
+    def _download(self, url: str) -> Response | None:
         if not self.allowed(url):
             return None
         rp = self._robots_for(url)

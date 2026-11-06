@@ -410,3 +410,37 @@ def test_guessed_level_settled_by_the_plan_text(client):
         assert (guessed.level, guessed.name, guessed.level_note) == (-1, "Basement", None)
         pipeline._floor_from_plan_text(first, {"level": 5, "confidence": 0.9})
         assert first.level == 1  # a level nobody guessed is left alone
+
+
+def test_rerun_a_crawl_from_saved_copies(client):
+    src = client.post(
+        "/api/sources",
+        json={"name": "Campus", "seed_urls": ["https://uni.example.edu/"], "location_hint": "Madison, WI"},
+    ).json()
+    first = client.get(f"/api/jobs/{client.post(f'/api/sources/{src['id']}/crawl').json()['job_id']}").json()
+    assert first["result"]["found"] == 1 and first["result"]["downloaded"] >= 2
+    saved = next(x for x in client.get("/api/sources").json() if x["id"] == src["id"])["saved"]
+    assert saved["responses"] >= 2 and saved["bytes"] > 0
+
+    # The site goes away; lookups were cached too, so a re-run needs no network at all.
+    def offline(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=req)
+
+    http.set_transport(httpx.MockTransport(offline))
+
+    # Plain crawl again: what's on the map is skipped.
+    again = client.get(f"/api/jobs/{client.post(f'/api/sources/{src['id']}/crawl', json={'use_saved': True}).json()['job_id']}").json()
+    assert again["status"] == "done" and again["result"]["found"] == 0
+
+    # From scratch, keeping the map: the plan on the map stays and isn't found twice.
+    r = client.post(f"/api/sources/{src['id']}/crawl", json={"use_saved": True, "fresh": True}).json()
+    assert r["reset"] == {"plans": 0, "floors": 0, "buildings": 0}
+
+    # From scratch, taking the website's plans off the map too: everything comes back from disk.
+    r = client.post(f"/api/sources/{src['id']}/crawl", json={"use_saved": True, "fresh": True, "remove_from_map": True}).json()
+    assert r["reset"] == {"plans": 1, "floors": 1, "buildings": 1}
+    job = client.get(f"/api/jobs/{r['job_id']}").json()
+    assert job["status"] == "done", job
+    assert job["result"]["found"] == 1 and job["result"]["downloaded"] == 0 and job["result"]["from_saved"] >= 2
+    assert len(client.get("/api/buildings").json()) == 1
+    assert job["label"].endswith("from saved copies")

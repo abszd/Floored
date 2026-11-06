@@ -73,6 +73,10 @@ class Floor(Base):
     geojson: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     # Earlier versions of the plan for undo, newest last (see pipeline.snapshot).
     history: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    # What the converter and the automatic fit produced, before any hand edits:
+    # {conversion, placement, fit_iou, converter, image_path, image_size, at}.
+    # Kept to learn from the fixes people make (see floored.feedback).
+    machine: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -181,3 +185,18 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Correction(Base):
+    """One fix a person made to what the machine produced, for improving the converter and matching."""
+
+    __tablename__ = "corrections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_id)
+    floor_id: Mapped[str | None] = mapped_column(ForeignKey("floors.id", ondelete="CASCADE"), index=True)
+    building_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    # crop, split_floor, merge_rooms, split_room, add_room, delete_room, delete_lines, set_kind,
+    # rename, move, autofit, line_up, set_level, rename_floor, copy_floor, undo, reconvert, match
+    op: Mapped[str] = mapped_column(String(32))
+    params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

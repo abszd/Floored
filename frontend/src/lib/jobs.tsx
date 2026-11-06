@@ -23,13 +23,22 @@ const Ctx = createContext<JobsContext | null>(null);
 
 /** What a finished crawl found, in words. */
 export function crawlSummary(job: Job): string {
-  const r = job.result as { found?: number; buildings?: number; auto_buildings?: number; to_review?: number; stopped?: boolean };
+  const r = job.result as {
+    found?: number;
+    buildings?: number;
+    auto_buildings?: number;
+    to_review?: number;
+    stopped?: boolean;
+    from_saved?: number;
+    downloaded?: number;
+  };
   if (r.found == null) return job.message ?? "";
   if (!r.found) return r.stopped ? "Stopped early. No floor plans found yet." : "No new floor plans found.";
   const parts = [`${r.found} plan${r.found === 1 ? "" : "s"} in ${r.buildings} building${r.buildings === 1 ? "" : "s"}`];
   if (r.auto_buildings) parts.push(`${r.auto_buildings} put on the map`);
   if (r.to_review) parts.push(`${r.to_review} to review`);
-  return (r.stopped ? "Stopped early. " : "") + parts.join(", ") + ".";
+  const offline = r.from_saved ? ` Used ${r.from_saved} saved page${r.from_saved === 1 ? "" : "s"} and files${r.downloaded ? `, downloaded ${r.downloaded}` : ""}.` : "";
+  return (r.stopped ? "Stopped early. " : "") + parts.join(", ") + "." + offline;
 }
 
 /** Polls the background workers, refreshes data as jobs finish, and reports outcomes. */

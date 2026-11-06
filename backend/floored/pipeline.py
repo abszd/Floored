@@ -15,11 +15,12 @@ from .config import get_settings
 from .converters import ConversionResult, get_converter
 from .db import session_scope
 from .geo import matching
-from .models import Building, Candidate, Draft, Floor, Source
+from .models import Building, Candidate, Correction, Draft, Floor, Source
 from .placement.fit import default_placement, fit_to_footprint
 from .placement.geojson import floor_geojson
 from .placement.transform import Placement
 from .scraper.crawler import CrawlConfig, crawl
+from .scraper.fetch import Fetcher
 
 log = logging.getLogger(__name__)
 
@@ -242,13 +243,21 @@ def process_floor(
             _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             floor.status = "placed"
             refresh_geojson(floor)
+            remember_machine(floor, None)
             return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": None, "status": floor.status}
+        # The machine's own output, before it is split or placed.
+        whole = {"conversion": floor.conversion, "image_path": floor.image_path, "image_size": [floor.image_width, floor.image_height]}
         parts = auto_split(s, floor) if split else []
         if not parts:
             _floor_from_plan_text(floor, (data.get("meta") or {}).get("floor"))
             fit = autoplace(floor, floor.building)
+            remember_machine(floor, fit)
             return {"floor_id": floor_id, "rooms": len(conv.rooms), "fit": fit, "status": floor.status}
         # Parts of the sheet the converter found no rooms in are converted on their own.
+        for f in parts:
+            remember_machine(f, {"iou": f.fit_score})
+            # Each part's machine output is the whole sheet's; final.json says which box it is.
+            f.machine = {**f.machine, **whole, "auto_split": True}
         empty = [(f.id, f"Converting {f.building.name} · {f.name}") for f in parts if not (f.conversion or {}).get("rooms")]
         for f in parts:
             if f.id in dict(empty):
@@ -503,6 +512,43 @@ def confirm_draft(
     return b, ids
 
 
+def reset_source(s: Session, src: Source, *, remove_from_map: bool = False) -> dict[str, int]:
+    """Forget what a website's crawls found, so the next crawl finds it all again.
+
+    Plans waiting for review (or rejected) and their temp buildings go. Plans
+    already on the map stay, and the next crawl skips them, unless
+    ``remove_from_map``: then their floors go too, and buildings left with
+    no floors at all.
+    """
+    plans = floors = buildings = 0
+    touched: set[str] = set()
+    for c in list(src.candidates):
+        on_map = c.floor_id is not None and c.status in ("approved", "processed")
+        if on_map and not remove_from_map:
+            continue
+        if c.floor_id:
+            f = s.get(Floor, c.floor_id)
+            if f is not None:
+                touched.add(f.building_id)
+                s.delete(f)
+                floors += 1
+        s.delete(c)
+        plans += 1
+    s.flush()
+    for d in list(src.drafts):
+        if not d.candidates:
+            s.delete(d)
+    s.flush()
+    for bid in touched:
+        b = s.get(Building, bid)
+        if b is not None and not b.floors:
+            s.delete(b)
+            buildings += 1
+    src.last_crawled_at = None
+    s.flush()
+    return {"plans": plans, "floors": floors, "buildings": buildings}
+
+
 def convert_label(c: Candidate) -> str:
     building = c.draft.name if c.draft else (c.building_guess or "Plan")
     return f"Converting {building}" + (f" · {c.level_label}" if c.level_label else "")
@@ -561,6 +607,32 @@ def spread_levels(b: Building) -> int:
 
 
 # ---------------------------------------------------------------- editing
+
+
+def log_fix(s: Session, floor: Floor | None, op: str, *, building_id: str | None = None, **params: Any) -> None:
+    """Note a fix a person made, so the converter and matching can learn from it (see floored.feedback)."""
+    s.add(
+        Correction(
+            floor_id=floor.id if floor is not None else None,
+            building_id=building_id or (floor.building_id if floor is not None else None),
+            op=op,
+            params=params,
+        )
+    )
+
+
+def remember_machine(floor: Floor, fit: dict[str, Any] | None) -> None:
+    """Keep what the converter and the fit produced, untouched by later edits."""
+    floor.machine = {
+        "conversion": floor.conversion,
+        "placement": floor.placement,
+        "fit_iou": (fit or {}).get("iou"),
+        "ambiguous": (fit or {}).get("ambiguous"),
+        "converter": floor.converter,
+        "image_path": floor.image_path,
+        "image_size": [floor.image_width, floor.image_height],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
 
 HISTORY_LIMIT = 12
 _SNAP_FIELDS = ("conversion", "placement", "status", "fit_score", "image_path", "image_width", "image_height", "level", "name", "level_note")
@@ -644,6 +716,10 @@ def split_floor(
     anchor: Placement | None = None
     for i, (r, bx) in enumerate(zip(regions, boxes)):
         sub = editing.crop_conversion(conv, bx)
+        # Where this part sits in the image the converter saw, so fixes can be compared with its output.
+        org = (conv.get("meta") or {}).get("origin") or {"floor": floor.id, "box": [0, 0, w, h]}
+        ox, oy = org["box"][0], org["box"][1]
+        sub["meta"]["origin"] = {"floor": org["floor"], "box": [ox + bx[0], oy + bx[1], ox + bx[2], oy + bx[3]]}
         ring = r.get("outline")
         if ring and len(ring) >= 3:
             sub["outline"] = [[float(x) - bx[0], float(y) - bx[1]] for x, y in ring]
@@ -783,8 +859,15 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
     from .converters import external
 
     reader = external.read_floor if external.is_available() else None
+    # "use_saved": answer from copies an earlier crawl saved, sending the site no requests.
+    fetcher = Fetcher(use_saved=payload.get("use_saved"))
     for found in crawl(
-        cfg, skip_assets=skip, progress=crawl_progress, should_stop=lambda: progress.stop_requested, floor_reader=reader
+        cfg,
+        fetcher=fetcher,
+        skip_assets=skip,
+        progress=crawl_progress,
+        should_stop=lambda: progress.stop_requested,
+        floor_reader=reader,
     ):
         with session_scope() as s:
             c = Candidate(
@@ -859,6 +942,8 @@ def _crawl_job(payload: dict[str, Any], progress: jobs.Progress) -> dict[str, An
         "auto_processed": len(to_convert),
         "to_review": to_review,
         "stopped": stopped,
+        "from_saved": fetcher.from_saved,
+        "downloaded": fetcher.downloaded,
     }
 
 

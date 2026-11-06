@@ -131,20 +131,25 @@ export const api = {
     request<{ room_ids: string[]; floor: Floor }>(`/api/floors/${floorId}/rooms/${roomId}/split`, json("POST", { line })),
   addRoom: (floorId: string, body: { ring: [number, number][]; label?: string | null; kind?: RoomKind }) =>
     request<{ room_id: string; floor: Floor }>(`/api/floors/${floorId}/rooms`, json("POST", body)),
-  splitFloor: (floorId: string, body: { regions: SheetRegion[]; refit?: boolean; reconvert?: boolean }) =>
-    request<{ floor: Floor; floors: FloorSummary[]; job_ids: string[] }>(`/api/floors/${floorId}/split`, json("POST", body)),
+  splitFloor: (floorId: string, body: { regions: SheetRegion[]; refit?: boolean; reconvert?: boolean; also?: string[] }) =>
+    request<{ floor: Floor; floors: FloorSummary[]; also_cropped: string[]; job_ids: string[] }>(`/api/floors/${floorId}/split`, json("POST", body)),
   duplicateFloor: (floorId: string, body: { level?: number; name?: string } = {}) =>
     request<Floor>(`/api/floors/${floorId}/duplicate`, json("POST", body)),
   lineUpAll: (floorId: string) => request<{ moved: number }>(`/api/floors/${floorId}/line-up-all`, json("POST")),
   undoFloor: (floorId: string) => request<{ undone: string; floor: Floor }>(`/api/floors/${floorId}/undo`, json("POST")),
 
   sources: () => request<Source[]>("/api/sources"),
-  createSource: (body: Omit<Source, "id" | "last_crawled_at" | "candidate_counts">) =>
+  createSource: (body: Omit<Source, "id" | "last_crawled_at" | "candidate_counts" | "saved">) =>
     request<Source>("/api/sources", json("POST", body)),
-  updateSource: (id: string, body: Partial<Omit<Source, "id" | "last_crawled_at" | "candidate_counts">>) =>
+  updateSource: (id: string, body: Partial<Omit<Source, "id" | "last_crawled_at" | "candidate_counts" | "saved">>) =>
     request<Source>(`/api/sources/${id}`, json("PATCH", body)),
   deleteSource: (id: string) => request<void>(`/api/sources/${id}`, { method: "DELETE" }),
-  crawl: (id: string) => request<{ job_id: string }>(`/api/sources/${id}/crawl`, json("POST")),
+  crawl: (id: string, opts: { use_saved?: boolean; fresh?: boolean; remove_from_map?: boolean } = {}) =>
+    request<{ job_id: string; reset: { plans: number; floors: number; buildings: number } | null }>(
+      `/api/sources/${id}/crawl`,
+      json("POST", opts),
+    ),
+  clearSaved: (id: string) => request<void>(`/api/sources/${id}/saved`, { method: "DELETE" }),
 
   candidates: (status?: string) =>
     request<Candidate[]>(`/api/candidates${status ? `?status=${encodeURIComponent(status)}` : ""}`),

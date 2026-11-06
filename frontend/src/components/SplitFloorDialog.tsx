@@ -57,6 +57,7 @@ export default function SplitFloorDialog({ floorId, onClose }: { floorId: string
   const [regions, setRegions] = useState<Region[]>([]);
   const [refit, setRefit] = useState(true);
   const [reconvert, setReconvert] = useState(false);
+  const [alike, setAlike] = useState(true);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [draft, setDraft] = useState<Box | null>(null);
   const svg = useRef<SVGSVGElement>(null);
@@ -135,12 +136,17 @@ export default function SplitFloorDialog({ floorId, onClose }: { floorId: string
         })),
         refit,
         reconvert,
+        also: regions.length === 1 && alike ? f?.same_layout : [],
       }),
-    onSuccess: async ({ floors, job_ids }) => {
+    onSuccess: async ({ floors, also_cropped, job_ids }) => {
       job_ids.forEach((id) => track(id, "Finding rooms", { quiet: true }));
       await qc.invalidateQueries();
       toast.success(
-        floors.length > 1 ? `Split into ${floors.length} floors` : "Plan cropped",
+        floors.length > 1
+          ? `Split into ${floors.length} floors`
+          : also_cropped.length
+            ? `Cropped this plan and ${also_cropped.length} other page${also_cropped.length > 1 ? "s" : ""}`
+            : "Plan cropped",
         job_ids.length ? "Finding rooms in the parts that had none." : "Undo it from the floor's menu if it's not right.",
       );
       onClose();
@@ -308,6 +314,15 @@ export default function SplitFloorDialog({ floorId, onClose }: { floorId: string
             )}
 
             <div className="mt-4 space-y-2 text-sm">
+              {regions.length === 1 && f.same_layout.length > 0 && (
+                <label className="flex items-start gap-2">
+                  <input type="checkbox" className="mt-1 accent-indigo-600" checked={alike} onChange={(e) => setAlike(e.target.checked)} />
+                  <span>
+                    Crop the other {f.same_layout.length} page{f.same_layout.length > 1 ? "s" : ""} of this file the same way
+                    <span className="block text-xs text-slate-500">They're the same size, so the title block is likely in the same place.</span>
+                  </span>
+                </label>
+              )}
               <label className="flex items-start gap-2">
                 <input type="checkbox" className="mt-1 accent-indigo-600" checked={refit} onChange={(e) => setRefit(e.target.checked)} />
                 <span>
